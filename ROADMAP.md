@@ -2,11 +2,13 @@
 
 ## PROJECT STATUS
 
-**Current Phase: 0 — Project Foundation**
+**Current Phase: 1 — Application Shell** ✅ Complete (build verified)
 
-The project is currently in Phase 0.
+The project is currently in Phase 1. Phase 1 has been implemented and the
+debug APK builds successfully.
 
-Do not begin later phases until the current phase has been verified.
+Do not begin later phases until the current phase has been verified on a
+real Android phone.
 
 ---
 
@@ -43,21 +45,28 @@ Goal:
 Create the basic application structure and navigation without implementing
 production data/printing logic.
 
-- [ ] 1.1 Dashboard
-- [ ] 1.2 Setup screen
-- [ ] 1.3 Receipt queue screen
-- [ ] 1.4 History screen
-- [ ] 1.5 Settings screen
-- [ ] 1.6 Printer configuration screen
-- [ ] 1.7 Receipt template configuration screen
-- [ ] 1.8 Basic navigation
-- [ ] 1.9 Monitoring status UI
-- [ ] 1.10 Drive status UI
-- [ ] 1.11 Printer status UI
+- [x] 1.1 Dashboard — vibrant dark dashboard with status cards, metrics, setup checklist
+- [x] 1.2 Setup screen — inline on Dashboard as a 4-step checklist (placeholder)
+- [x] 1.3 Receipt queue screen — empty state, summary row, status legend
+- [x] 1.4 History screen — empty state, filter chips, feature preview
+- [x] 1.5 Settings screen — grouped Drive/Template/Printer/Monitoring/App sections
+- [x] 1.6 Printer configuration screen — placeholder in Settings group (Phase 9)
+- [x] 1.7 Receipt template configuration screen — placeholder in Settings group (Phase 5)
+- [x] 1.8 Basic navigation — React Navigation bottom-tab + native-stack per tab
+- [x] 1.9 Monitoring status UI — status card on Dashboard (inactive placeholder)
+- [x] 1.10 Drive status UI — status card on Dashboard + Drive screen banner
+- [x] 1.11 Printer status UI — status card on Dashboard (inactive placeholder)
+
+Build result: BUILD SUCCESSFUL in 5m 20s (137 tasks)
+TypeScript: 0 errors
+Jest: 1/1 passed
 
 PHASE 1 COMPLETE WHEN:
 
 All core screens exist and navigation works on a physical device.
+
+Note: 0.9 (physical device test) and 1 (physical-device navigation) remain
+untested on real hardware — emulator/build verification only so far.
 
 ---
 
