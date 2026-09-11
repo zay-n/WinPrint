@@ -23,6 +23,8 @@ import {
 
 import DashboardScreen from '../screens/dashboard/DashboardScreen';
 import DriveScreen from '../screens/drive/DriveScreen';
+import TransactionDetailScreen from '../screens/drive/TransactionDetailScreen';
+import ReceiptPreviewScreen from '../screens/drive/ReceiptPreviewScreen';
 import QueueScreen from '../screens/queue/QueueScreen';
 import HistoryScreen from '../screens/history/HistoryScreen';
 import SettingsScreen from '../screens/settings/SettingsScreen';
@@ -55,6 +57,22 @@ function DriveNavigator() {
         component={DriveScreen}
         options={{
           title: 'Google Drive',
+          ...headerOptions,
+        }}
+      />
+      <DriveStack.Screen
+        name="TransactionDetail"
+        component={TransactionDetailScreen}
+        options={{
+          title: 'Parsed Transaction',
+          ...headerOptions,
+        }}
+      />
+      <DriveStack.Screen
+        name="ReceiptPreview"
+        component={ReceiptPreviewScreen}
+        options={{
+          title: 'Receipt Preview',
           ...headerOptions,
         }}
       />

@@ -18,16 +18,33 @@ import {
   StyleSheet,
   Text,
   View,
+  Pressable,
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
+import { useNavigation } from '@react-navigation/native';
+import type { DashboardScreenProps } from '../../navigation/types';
 import Icon from '../../components/Icon';
 
 import StatusCard from '../../components/StatusCard';
 import MetricCard from '../../components/MetricCard';
 import SectionHeader from '../../components/SectionHeader';
 import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
+import {useAppStore} from '../../store/useAppStore';
 
 export default function DashboardScreen() {
+  const user = useAppStore(s => s.user);
+  const accessToken = useAppStore(s => s.accessToken);
+  const sourceFolderName = useAppStore(s => s.sourceFolderName);
+  const queue = useAppStore(s => s.queue);
+  const driveConnected = Boolean(user && accessToken);
+  const navigation = useNavigation<DashboardScreenProps['navigation']>();
+
+  const pendingCount = queue.filter(q => q.status === 'QUEUED' || q.status === 'PRINTING').length;
+  const printedItems = queue.filter(q => q.status === 'PRINTED');
+  const printedCount = printedItems.length;
+  const failedCount = queue.filter(q => q.status === 'FAILED').length;
+  const lastReceipt = printedCount > 0 ? printedItems[printedItems.length - 1] : null;
+
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <StatusBar barStyle="light-content" />
@@ -68,9 +85,13 @@ export default function DashboardScreen() {
           <StatusCard
             icon="google-drive"
             title="Drive"
-            value="Not connected"
-            subLabel="Sign in required"
-            variant="inactive"
+            value={driveConnected ? 'Connected' : 'Not connected'}
+            subLabel={
+              driveConnected
+                ? (sourceFolderName ?? 'No folder selected')
+                : 'Sign in required'
+            }
+            variant={driveConnected ? 'active' : 'inactive'}
             style={styles.statusCardThird}
           />
           <StatusCard
@@ -87,45 +108,53 @@ export default function DashboardScreen() {
         <SectionHeader title="Today's Activity" style={styles.sectionHeader} />
 
         <View style={styles.metricsRow}>
-          <MetricCard
-            icon="clock-outline"
-            label="Pending"
-            value="0"
-            accent={Colors.warning}
-          />
-          <MetricCard
-            icon="check-circle-outline"
-            label="Printed Today"
-            value="0"
-            accent={Colors.active}
-          />
-          <MetricCard
-            icon="alert-circle-outline"
-            label="Failed"
-            value="0"
-            accent={Colors.error}
-          />
+          <Pressable style={styles.metricWrapper} onPress={() => navigation.navigate('Queue')}>
+            <MetricCard
+              icon="clock-outline"
+              label="Pending"
+              value={pendingCount.toString()}
+              accent={Colors.warning}
+            />
+          </Pressable>
+          <Pressable style={styles.metricWrapper} onPress={() => navigation.navigate('History')}>
+            <MetricCard
+              icon="check-circle-outline"
+              label="Printed"
+              value={printedCount.toString()}
+              accent={Colors.active}
+            />
+          </Pressable>
+          <Pressable style={styles.metricWrapper} onPress={() => navigation.navigate('Queue')}>
+            <MetricCard
+              icon="alert-circle-outline"
+              label="Failed"
+              value={failedCount.toString()}
+              accent={Colors.error}
+            />
+          </Pressable>
         </View>
 
         {/* ── Last Receipt ──────────────────────────────────────────── */}
         <SectionHeader title="Last Receipt" style={styles.sectionHeader} />
 
-        <View style={styles.lastReceiptCard}>
+        <Pressable 
+          style={({pressed}) => [styles.lastReceiptCard, pressed && { opacity: 0.8 }]}
+          onPress={() => navigation.navigate('History')}>
           <Icon
             name="receipt"
             size={28}
-            color={Colors.inactive}
+            color={lastReceipt ? Colors.active : Colors.inactive}
             style={styles.lastReceiptIcon}
           />
           <View style={styles.lastReceiptContent}>
-            <Text style={styles.lastReceiptPlaceholder}>
-              No receipts printed yet
+            <Text style={[styles.lastReceiptPlaceholder, lastReceipt && { color: Colors.textPrimary }]}>
+              {lastReceipt ? `${lastReceipt.receipt.transactionType} ${lastReceipt.receipt.transactionNumber}` : 'No receipts printed yet'}
             </Text>
             <Text style={styles.lastReceiptSub}>
-              Printed receipts will appear here
+              {lastReceipt ? `Customer: ${lastReceipt.receipt.customer.name || 'N/A'}\nPrinted at: ${new Date(lastReceipt.completedAt || 0).toLocaleString()}` : 'Printed receipts will appear here'}
             </Text>
           </View>
-        </View>
+        </Pressable>
 
         {/* ── Setup Prompt ──────────────────────────────────────────── */}
         <SectionHeader title="Setup Required" style={styles.sectionHeader} />
@@ -281,6 +310,9 @@ const styles = StyleSheet.create({
   metricsRow: {
     flexDirection: 'row',
     gap: Spacing.sm,
+  },
+  metricWrapper: {
+    flex: 1,
   },
 
   // Last Receipt

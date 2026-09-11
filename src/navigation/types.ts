@@ -27,6 +27,13 @@ export type DashboardStackParamList = {
 
 export type DriveStackParamList = {
   DriveHome: undefined;
+  TransactionDetail: {
+    receiptIndex: number;
+  };
+  ReceiptPreview: {
+    receiptIndex: number;
+    pdfPath: string;
+  };
 };
 
 export type QueueStackParamList = {

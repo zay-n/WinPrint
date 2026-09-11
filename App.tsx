@@ -5,18 +5,25 @@
  * Wraps the entire tree with required providers and mounts AppNavigator.
  */
 
-import React from 'react';
+import React, {useEffect} from 'react';
 import {StatusBar} from 'react-native';
 import {NavigationContainer} from '@react-navigation/native';
 import {SafeAreaProvider} from 'react-native-safe-area-context';
 import {enableScreens} from 'react-native-screens';
 
 import AppNavigator from './src/navigation/AppNavigator';
+import {useAppStore} from './src/store/useAppStore';
 
 // Enable native screens for React Navigation performance
 enableScreens();
 
 export default function App() {
+  const restoreSession = useAppStore(state => state.restoreSession);
+
+  useEffect(() => {
+    void restoreSession();
+  }, [restoreSession]);
+
   return (
     <SafeAreaProvider>
       {/*
