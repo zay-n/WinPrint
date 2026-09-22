@@ -12,6 +12,7 @@ class WinsoftPrintPackage : ReactPackage {
     listOf(
       AndroidPrintModule(reactContext),
       BluetoothThermalPrinterModule(reactContext),
+      MonitoringModule(reactContext),
     )
 
   override fun createViewManagers(

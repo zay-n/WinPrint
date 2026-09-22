@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <!-- FCM heads-up notifications — required on Android 13+ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- WorkManager needs this to schedule work after device reboot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
       android:name=".MainApplication"
@@ -15,6 +19,7 @@
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="${usesCleartextTraffic}"
       android:supportsRtl="true">
+
       <provider
         android:name="androidx.core.content.FileProvider"
         android:authorities="${applicationId}.fileprovider"
@@ -24,6 +29,7 @@
           android:name="android.support.FILE_PROVIDER_PATHS"
           android:resource="@xml/receipt_pdf_paths" />
       </provider>
+
       <activity
         android:name=".MainActivity"
         android:label="@string/app_name"
@@ -35,6 +41,30 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
+        <!-- Deep-link intent for PRINT notification action.
+             Launched by WinsoftFcmService via PendingIntent.getActivity().
+             Avoids notification trampoline pattern (direct Activity launch). -->
+        <intent-filter>
+            <action android:name="com.winsoftprintstation.ACTION_PRINT" />
+            <category android:name="android.intent.category.DEFAULT" />
+        </intent-filter>
       </activity>
+
+      <!-- Firebase Cloud Messaging service.
+           Handles token refresh and incoming data messages. -->
+      <service
+        android:name=".WinsoftFcmService"
+        android:exported="false">
+        <intent-filter>
+            <action android:name="com.google.firebase.MESSAGING_EVENT" />
+        </intent-filter>
+      </service>
+
+      <!-- BroadcastReceiver for the LATER notification action.
+           Dismisses the notification and stores the deferred file ID. -->
+      <receiver
+        android:name=".NotificationActionReceiver"
+        android:exported="false" />
+
     </application>
 </manifest>

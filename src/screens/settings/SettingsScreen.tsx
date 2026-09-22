@@ -13,12 +13,14 @@
  *  - App
  */
 
-import React, {useState} from 'react';
+import React, {useCallback, useState} from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Modal,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TouchableOpacity,
   View,
@@ -31,6 +33,7 @@ import SettingsRow from '../../components/SettingsRow';
 import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
 import {useAppStore} from '../../store/useAppStore';
 import type {BluetoothDevice, PrinterType} from '../../services/printer/PrinterAdapter';
+import * as MonitoringService from '../../services/monitoring/MonitoringService';
 
 export default function SettingsScreen() {
   const user = useAppStore(s => s.user);
@@ -48,11 +51,76 @@ export default function SettingsScreen() {
   const testPrintCurrentPrinter = useAppStore(s => s.testPrintCurrentPrinter);
   const clearPrinterError = useAppStore(s => s.clearPrinterError);
 
+  const monitoringEnabled = useAppStore(s => s.monitoringEnabled);
+  const fcmRegistrationStatus = useAppStore(s => s.fcmRegistrationStatus);
+  const serviceAccountEmail = useAppStore(s => s.serviceAccountEmail);
+  const lastDriveNotificationAt = useAppStore(s => s.lastDriveNotificationAt);
+  const lastReconciliationAt = useAppStore(s => s.lastReconciliationAt);
+  const lastMonitoringError = useAppStore(s => s.lastMonitoringError);
+  const enableMonitoring = useAppStore(s => s.enableMonitoring);
+  const disableMonitoring = useAppStore(s => s.disableMonitoring);
+  const setMonitoringError = useAppStore(s => s.setMonitoringError);
+
   const [typeModalVisible, setTypeModalVisible] = useState(false);
   const [deviceModalVisible, setDeviceModalVisible] = useState(false);
   const [connectionModalVisible, setConnectionModalVisible] = useState(false);
   const [testingPrint, setTestingPrint] = useState(false);
   const [testSuccess, setTestSuccess] = useState<string | null>(null);
+  const [checkingNow, setCheckingNow] = useState(false);
+
+  const handleToggleMonitoring = useCallback(async (value: boolean) => {
+    if (value) {
+      const status = await MonitoringService.requestNotificationPermission();
+      if (status === 'denied') {
+        Alert.alert(
+          'Notifications Blocked',
+          'Enable notifications for Winsoft Print Station in Android Settings to receive bill alerts.',
+        );
+        return;
+      }
+      enableMonitoring();
+      // Explicitly trigger registration now that monitoring is enabled.
+      // initialize() may have run before sourceFolderId was available.
+      await MonitoringService.ensureRegistered();
+    } else {
+      disableMonitoring();
+    }
+  }, [enableMonitoring, disableMonitoring]);
+
+  const handleCheckNow = useCallback(async () => {
+    setCheckingNow(true);
+    setMonitoringError(null);
+    try {
+      await MonitoringService.runReconciliation();
+    } catch (e) {
+      setMonitoringError(String(e));
+    } finally {
+      setCheckingNow(false);
+    }
+  }, [setMonitoringError]);
+
+  const formatTimestamp = (ts: number | null): string => {
+    if (!ts) return 'Never';
+    return new Date(ts).toLocaleString();
+  };
+
+  const fcmStatusLabel = (): string => {
+    switch (fcmRegistrationStatus) {
+      case 'registered': return 'Registered ✓';
+      case 'registering': return 'Registering…';
+      case 'error': return 'Error';
+      default: return 'Not registered';
+    }
+  };
+
+  const fcmStatusColor = (): string => {
+    switch (fcmRegistrationStatus) {
+      case 'registered': return Colors.active;
+      case 'registering': return Colors.warning;
+      case 'error': return Colors.error;
+      default: return Colors.inactive;
+    }
+  };
 
   const handleSelectType = (type: PrinterType) => {
     setPrinterType(type);
@@ -228,26 +296,85 @@ export default function SettingsScreen() {
         {/* ── Monitoring ───────────────────────────────────────────── */}
         <SectionHeader title="Monitoring" style={styles.sectionGap} />
         <View style={styles.group}>
+          {/* Toggle */}
+          <View style={styles.monitoringToggleRow}>
+            <Icon name="radar" size={22} color={monitoringEnabled ? Colors.active : Colors.inactive} />
+            <View style={styles.monitoringToggleContent}>
+              <Text style={styles.monitoringToggleLabel}>Notification Monitoring</Text>
+              <Text style={styles.monitoringToggleSub}>
+                {monitoringEnabled ? 'Active — watching for new Winsoft bills' : 'Disabled'}
+              </Text>
+            </View>
+            <Switch
+              value={monitoringEnabled}
+              onValueChange={handleToggleMonitoring}
+              trackColor={{false: Colors.inactive, true: Colors.active}}
+              thumbColor={Colors.textPrimary}
+            />
+          </View>
+
+          {/* FCM Registration status */}
+          <View style={styles.monitoringDivider} />
           <SettingsRow
-            icon="radar"
-            iconColor={Colors.active}
-            label="Background Monitoring"
-            detail="Disabled"
-            isFirst
+            icon="broadcast"
+            iconColor={fcmStatusColor()}
+            label="FCM Registration"
+            detail={fcmStatusLabel()}
           />
-          <SettingsRow
-            icon="printer-pos-outline"
-            iconColor={Colors.active}
-            label="Auto-Print"
-            detail="Off"
-          />
+
+          {/* Service account email — for folder sharing */}
+          {serviceAccountEmail ? (
+            <SettingsRow
+              icon="account-key-outline"
+              iconColor={Colors.textSecondary}
+              label="Share folder with"
+              detail={serviceAccountEmail}
+            />
+          ) : null}
+
+          {/* Timestamps */}
           <SettingsRow
             icon="bell-outline"
-            iconColor={Colors.active}
-            label="Notifications"
-            detail="Not configured"
-            isLast
+            iconColor={Colors.primary}
+            label="Last Drive Notification"
+            detail={formatTimestamp(lastDriveNotificationAt)}
           />
+          <SettingsRow
+            icon="timer-sync-outline"
+            iconColor={Colors.primary}
+            label="Last Reconciliation"
+            detail={formatTimestamp(lastReconciliationAt)}
+          />
+
+          {/* Error (dismissible) */}
+          {lastMonitoringError ? (
+            <View style={styles.monitoringErrorRow}>
+              <Icon name="alert-circle-outline" size={16} color={Colors.error} />
+              <Text style={styles.monitoringErrorText} numberOfLines={2}>
+                {lastMonitoringError}
+              </Text>
+              <TouchableOpacity onPress={() => setMonitoringError(null)}>
+                <Icon name="close" size={16} color={Colors.textSecondary} />
+              </TouchableOpacity>
+            </View>
+          ) : null}
+
+          {/* Check Now */}
+          <View style={styles.monitoringDivider} />
+          <TouchableOpacity
+            style={styles.checkNowButton}
+            onPress={handleCheckNow}
+            disabled={checkingNow}
+            activeOpacity={0.7}>
+            {checkingNow ? (
+              <ActivityIndicator size="small" color={Colors.primary} />
+            ) : (
+              <Icon name="magnify-scan" size={18} color={Colors.primary} />
+            )}
+            <Text style={styles.checkNowText}>
+              {checkingNow ? 'Checking…' : 'Check Now'}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         {/* ── App ──────────────────────────────────────────────────── */}
@@ -700,4 +827,55 @@ const styles = StyleSheet.create({
   },
 
   bottomPad: {height: Spacing.xl},
+
+  // ── Monitoring panel ────────────────────────────────────────────────────
+  monitoringToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+    backgroundColor: Colors.card,
+    padding: Spacing.md,
+  },
+  monitoringToggleContent: {
+    flex: 1,
+  },
+  monitoringToggleLabel: {
+    ...Typography.bodyMedium,
+    color: Colors.textPrimary,
+  },
+  monitoringToggleSub: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
+    marginTop: 2,
+  },
+  monitoringDivider: {
+    height: 1,
+    backgroundColor: Colors.border,
+    marginHorizontal: Spacing.md,
+  },
+  monitoringErrorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
+    backgroundColor: Colors.errorDim,
+    padding: Spacing.md,
+  },
+  monitoringErrorText: {
+    ...Typography.caption,
+    color: Colors.error,
+    flex: 1,
+  },
+  checkNowButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.sm,
+    backgroundColor: Colors.card,
+    paddingVertical: Spacing.md,
+  },
+  checkNowText: {
+    ...Typography.bodyMedium,
+    color: Colors.primary,
+  },
 });
+

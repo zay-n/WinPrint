@@ -1,7 +1,7 @@
 /**
  * useAppStore.ts — Zustand application state
  *
- * Manages slices for Auth, Drive, CSV, PDF, Printer, and Queue.
+ * Manages slices for Auth, Drive, CSV, PDF, Printer, Queue, and Monitoring.
  */
 
 import {create} from 'zustand';
@@ -162,6 +162,38 @@ interface QueueActions {
 }
 
 // ---------------------------------------------------------------------------
+// Monitoring slice
+// ---------------------------------------------------------------------------
+
+export type FcmRegistrationStatus = 'unregistered' | 'registering' | 'registered' | 'error';
+
+interface MonitoringState {
+  monitoringEnabled: boolean;
+  fcmToken: string | null;
+  fcmRegistrationStatus: FcmRegistrationStatus;
+  /** Service account email displayed to users for folder-sharing setup. */
+  serviceAccountEmail: string | null;
+  lastDriveNotificationAt: number | null;
+  lastReconciliationAt: number | null;
+  lastMonitoringError: string | null;
+  /** "fileId::folderId" entries deferred by tapping LATER on a notification. */
+  deferredFileIds: string[];
+}
+
+interface MonitoringActions {
+  enableMonitoring: () => void;
+  disableMonitoring: () => void;
+  setFcmToken: (token: string) => void;
+  setFcmRegistrationStatus: (status: FcmRegistrationStatus) => void;
+  setServiceAccountEmail: (email: string) => void;
+  recordDriveNotification: () => void;
+  recordReconciliation: () => void;
+  setMonitoringError: (msg: string | null) => void;
+  addDeferredFileId: (entry: string) => void;
+  removeDeferredFileId: (entry: string) => void;
+}
+
+// ---------------------------------------------------------------------------
 // Combined store
 // ---------------------------------------------------------------------------
 
@@ -176,7 +208,10 @@ type AppStore = AuthState &
   PrinterState &
   PrinterActions &
   QueueState &
-  QueueActions;
+  QueueActions &
+  MonitoringState &
+  MonitoringActions;
+
 
 export const useAppStore = create<AppStore>()(
   persist(
@@ -671,7 +706,47 @@ export const useAppStore = create<AppStore>()(
             await updateQueueItemStatus(nextItem.identity, 'FAILED', result.error);
           }
         }
-      }
+      },
+
+      // ── Monitoring initial state ─────────────────────────────────────────────
+      monitoringEnabled: false,
+      fcmToken: null,
+      fcmRegistrationStatus: 'unregistered',
+      serviceAccountEmail: null,
+      lastDriveNotificationAt: null,
+      lastReconciliationAt: null,
+      lastMonitoringError: null,
+      deferredFileIds: [],
+
+      // ── Monitoring actions ───────────────────────────────────────────────────
+
+      enableMonitoring: () => set({ monitoringEnabled: true }),
+      disableMonitoring: () => set({ monitoringEnabled: false }),
+
+      setFcmToken: (token: string) => set({ fcmToken: token }),
+
+      setFcmRegistrationStatus: (status: FcmRegistrationStatus) =>
+        set({ fcmRegistrationStatus: status }),
+
+      setServiceAccountEmail: (email: string) => set({ serviceAccountEmail: email }),
+
+      recordDriveNotification: () => set({ lastDriveNotificationAt: Date.now() }),
+
+      recordReconciliation: () => set({ lastReconciliationAt: Date.now() }),
+
+      setMonitoringError: (msg: string | null) => set({ lastMonitoringError: msg }),
+
+      addDeferredFileId: (entry: string) =>
+        set(state => ({
+          deferredFileIds: state.deferredFileIds.includes(entry)
+            ? state.deferredFileIds
+            : [...state.deferredFileIds, entry],
+        })),
+
+      removeDeferredFileId: (entry: string) =>
+        set(state => ({
+          deferredFileIds: state.deferredFileIds.filter(id => id !== entry),
+        })),
     }),
     {
       name: 'winprint-storage',
@@ -679,6 +754,15 @@ export const useAppStore = create<AppStore>()(
       partialize: (state) => ({
         queue: state.queue,
         csvProgress: state.csvProgress,
+        // Monitoring state persisted across restarts
+        monitoringEnabled: state.monitoringEnabled,
+        fcmToken: state.fcmToken,
+        fcmRegistrationStatus: state.fcmRegistrationStatus,
+        serviceAccountEmail: state.serviceAccountEmail,
+        lastDriveNotificationAt: state.lastDriveNotificationAt,
+        lastReconciliationAt: state.lastReconciliationAt,
+        lastMonitoringError: state.lastMonitoringError,
+        deferredFileIds: state.deferredFileIds,
       }),
     }
   )
