@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FlatList, Pressable, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
+import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Icon from '../../components/Icon';
 import { Colors, Spacing, BorderRadius, Typography, Shadow } from '../../theme';
@@ -84,6 +84,12 @@ export default function HistoryScreen() {
 }
 
 function HistoryItemRow({ item }: { item: QueueItem }) {
+  const printedAt = item.completedAt
+    ? new Date(item.completedAt).toLocaleString([], {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      })
+    : 'Unknown';
+
   return (
     <View style={styles.itemCard}>
       <View style={styles.itemHeader}>
@@ -93,13 +99,26 @@ function HistoryItemRow({ item }: { item: QueueItem }) {
             {item.receipt.transactionType} {item.receipt.transactionNumber}
           </Text>
         </View>
+        <View style={styles.printedBadge}>
+          <Text style={styles.printedBadgeText}>Printed</Text>
+        </View>
       </View>
-      <Text style={styles.itemDetails}>
-        Customer: {item.receipt.customer.name || 'N/A'} {'\n'}
-        Amount: {item.receipt.financials.total}
-      </Text>
+      <View style={styles.itemMeta}>
+        <View style={styles.itemMetaRow}>
+          <Icon name="account-outline" size={13} color={Colors.textTertiary} />
+          <Text style={styles.itemMetaText}>
+            {item.receipt.customer.name || 'N/A'}
+          </Text>
+        </View>
+        <View style={styles.itemMetaRow}>
+          <Icon name="currency-usd" size={13} color={Colors.textTertiary} />
+          <Text style={styles.itemMetaText}>
+            {item.receipt.financials.total}
+          </Text>
+        </View>
+      </View>
       <Text style={styles.itemDate}>
-        Printed at: {item.completedAt ? new Date(item.completedAt).toLocaleString() : 'Unknown'}
+        {printedAt}
       </Text>
     </View>
   );
@@ -108,6 +127,7 @@ function HistoryItemRow({ item }: { item: QueueItem }) {
 function ArchiveProgressRow({ item, onRetry }: { item: CsvProgress; onRetry: () => void }) {
   const isFailed = item.archiveStatus === 'FAILED';
   const isPending = item.archiveStatus === 'PENDING';
+  const statusLabel = isFailed ? 'Archive failed' : isPending ? 'Archiving...' : 'Archived';
 
   return (
     <View style={[styles.itemCard, isFailed && styles.itemCardFailed]}>
@@ -119,15 +139,15 @@ function ArchiveProgressRow({ item, onRetry }: { item: CsvProgress; onRetry: () 
             color={isFailed ? Colors.error : isPending ? Colors.textSecondary : Colors.active}
           />
           <Text style={styles.itemTitle} numberOfLines={1}>
-            Drive File: {item.driveFileId.slice(0, 8)}...
+            CSV File
           </Text>
         </View>
         <Text style={[styles.itemStatus, isFailed && styles.itemStatusFailed, !isFailed && !isPending && styles.itemStatusSuccess]}>
-          {item.archiveStatus}
+          {statusLabel}
         </Text>
       </View>
       <Text style={styles.itemDetails}>
-        Printed: {item.printedCount} / {item.expectedCount} transactions
+        Printed: {item.printedCount} of {item.expectedCount} transactions
       </Text>
       
       {isFailed && item.archiveError && (
@@ -269,6 +289,32 @@ const styles = StyleSheet.create({
     color: Colors.textTertiary,
     fontSize: 10,
     marginTop: Spacing.xs,
+  },
+  printedBadge: {
+    backgroundColor: `${Colors.active}18`,
+    borderRadius: BorderRadius.full,
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: 2,
+    borderWidth: 1,
+    borderColor: `${Colors.active}40`,
+  },
+  printedBadgeText: {
+    ...Typography.label,
+    color: Colors.active,
+    fontWeight: '700',
+  },
+  itemMeta: {
+    gap: 4,
+    marginBottom: Spacing.xs,
+  },
+  itemMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs,
+  },
+  itemMetaText: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
   },
   retryBtn: {
     flexDirection: 'row',

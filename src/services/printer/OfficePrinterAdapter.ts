@@ -10,6 +10,7 @@
 
 import {NativeModules, Platform} from 'react-native';
 import type {Receipt} from '../../models/Receipt';
+import type {BusinessProfile, A4Template} from '../../models/Profile';
 import {generateReceiptPdf, receiptPdfFilename} from '../pdf/ReceiptPdfService';
 import type {PrinterAdapter, PrinterStatus, PrintResult} from './PrinterAdapter';
 
@@ -49,14 +50,14 @@ export class OfficePrinterAdapter implements PrinterAdapter {
     };
   }
 
-  public async print(receipt: Receipt): Promise<PrintResult> {
+  public async print(receipt: Receipt, profile?: BusinessProfile, template?: A4Template): Promise<PrintResult> {
     try {
       if (Platform.OS !== 'android' || !AndroidPrint) {
         throw new Error('Android Print Framework is not available on this platform.');
       }
 
       // 1. Ensure A4 PDF exists locally
-      const pdfPath = await generateReceiptPdf(receipt);
+      const pdfPath = await generateReceiptPdf(receipt, profile, template);
       const jobName = `Winsoft Receipt ${receipt.transactionNumber || receipt.transactionType}`;
 
       // 2. Send PDF to native Android Print Framework

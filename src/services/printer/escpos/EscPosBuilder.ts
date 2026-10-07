@@ -96,6 +96,51 @@ export class EscPosBuilder {
     return this;
   }
 
+  /**
+   * Appends text explicitly word-wrapped to the specified width.
+   * Continuation lines are indented by `indent` spaces.
+   */
+  public textWrapped(str: string, width = EscPosBuilder.DEFAULT_80MM_WIDTH, indent = 0): this {
+    if (!str) return this;
+    const safeIndent = Math.max(0, Math.min(indent, width - 1));
+    const indentStr = ' '.repeat(safeIndent);
+    const words = str.split(' ');
+    
+    let currentLine = '';
+    let isFirstLine = true;
+
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      if (word === '') continue; // Skip extra spaces
+
+      if (currentLine === '') {
+        currentLine = (isFirstLine ? '' : indentStr) + word;
+      } else {
+        const potentialLine = `${currentLine} ${word}`;
+        if (potentialLine.length <= width) {
+          currentLine = potentialLine;
+        } else {
+          this.line(currentLine);
+          isFirstLine = false;
+          currentLine = indentStr + word;
+        }
+      }
+
+      // Handle oversized words that exceed the width
+      while (currentLine.length > width) {
+        this.line(currentLine.slice(0, width));
+        currentLine = indentStr + currentLine.slice(width);
+        isFirstLine = false;
+      }
+    }
+
+    if (currentLine !== '' && currentLine !== indentStr) {
+      this.line(currentLine);
+    }
+    
+    return this;
+  }
+
   /** ESC d n — Feed n lines. */
   public feed(lines = 1): this {
     const count = Math.min(255, Math.max(1, lines));
@@ -128,7 +173,7 @@ export class EscPosBuilder {
     right: string,
     width = EscPosBuilder.DEFAULT_80MM_WIDTH,
   ): this {
-    const leftTrim = left.trim();
+    const leftTrim = left.trimEnd();
     const rightTrim = right.trim();
 
     const spaceCount = width - (leftTrim.length + rightTrim.length);

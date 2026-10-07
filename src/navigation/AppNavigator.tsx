@@ -6,7 +6,8 @@
  */
 
 import React from 'react';
-import {Platform, StyleSheet, View} from 'react-native';
+import {StyleSheet, View} from 'react-native';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
 import {createNativeStackNavigator} from '@react-navigation/native-stack';
 import Icon from '../components/Icon';
@@ -28,6 +29,8 @@ import ReceiptPreviewScreen from '../screens/drive/ReceiptPreviewScreen';
 import QueueScreen from '../screens/queue/QueueScreen';
 import HistoryScreen from '../screens/history/HistoryScreen';
 import SettingsScreen from '../screens/settings/SettingsScreen';
+import AdminScreen from '../screens/settings/AdminScreen';
+import BusinessSetupScreen from '../screens/settings/BusinessSetupScreen';
 
 // ─── Stack navigators (one per tab — ready for future nested screens) ─────────
 
@@ -121,6 +124,22 @@ function SettingsNavigator() {
           ...headerOptions,
         }}
       />
+      <SettingsStack.Screen
+        name="BusinessSetup"
+        component={BusinessSetupScreen}
+        options={{
+          title: 'Business & Receipt Setup',
+          ...headerOptions,
+        }}
+      />
+      <SettingsStack.Screen
+        name="AdminAccess"
+        component={AdminScreen}
+        options={{
+          title: 'Access Management',
+          ...headerOptions,
+        }}
+      />
     </SettingsStack.Navigator>
   );
 }
@@ -152,11 +171,17 @@ function TabIcon({name, focused, size}: TabIconProps) {
 }
 
 export default function AppNavigator() {
+  const insets = useSafeAreaInsets();
+  // Tab bar height = icon+label area + system bottom inset
+  // This correctly handles gesture navigation, 3-button nav, and varies by screen size
+  const TAB_CONTENT_HEIGHT = 56;
+  const tabBarHeight = TAB_CONTENT_HEIGHT + insets.bottom;
+
   return (
     <Tab.Navigator
       screenOptions={{
         headerShown: false,
-        tabBarStyle: styles.tabBar,
+        tabBarStyle: [styles.tabBar, {height: tabBarHeight, paddingBottom: insets.bottom}],
         tabBarShowLabel: true,
         tabBarLabelStyle: styles.tabLabel,
         tabBarActiveTintColor: Colors.tabActive,
@@ -238,9 +263,8 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.tabBackground,
     borderTopColor: Colors.border,
     borderTopWidth: 1,
-    height: Platform.OS === 'android' ? 60 : 80,
-    paddingBottom: Platform.OS === 'android' ? 8 : 20,
     paddingTop: 6,
+    // height and paddingBottom are set dynamically via useSafeAreaInsets
   },
   tabLabel: {
     fontSize: 11,

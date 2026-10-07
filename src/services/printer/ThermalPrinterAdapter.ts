@@ -10,6 +10,7 @@
 
 import {NativeModules, Platform, PermissionsAndroid} from 'react-native';
 import type {Receipt} from '../../models/Receipt';
+import type {BusinessProfile, ThermalTemplate} from '../../models/Profile';
 import type {
   PrinterAdapter,
   PrinterStatus,
@@ -20,6 +21,7 @@ import {
   buildThermalReceipt,
   buildTestThermalReceipt,
 } from './escpos/EscPosReceiptBuilder';
+import {debugEscPos} from './escpos/debugEscPos';
 
 interface BluetoothThermalPrinterNativeModule {
   getBondedDevices(): Promise<BluetoothDevice[]>;
@@ -133,7 +135,7 @@ export class ThermalPrinterAdapter implements PrinterAdapter {
   }
 
   /** Sends a normalized Receipt to the thermal printer. */
-  public async print(receipt: Receipt): Promise<PrintResult> {
+  public async print(receipt: Receipt, profile?: BusinessProfile, template?: ThermalTemplate): Promise<PrintResult> {
     try {
       if (Platform.OS !== 'android' || !BluetoothThermalPrinter) {
         throw new Error('Thermal printer is only available on Android.');
@@ -151,7 +153,11 @@ export class ThermalPrinterAdapter implements PrinterAdapter {
       }
 
       // 1. Build 80mm ESC/POS bytes
-      const bytes = buildThermalReceipt(receipt);
+      const bytes = buildThermalReceipt(receipt, profile, template);
+
+      if (__DEV__) {
+        console.log('=== THERMAL RECEIPT DEBUG ===\n' + debugEscPos(bytes) + '=============================');
+      }
 
       // 2. Encode to Base64 for native transmission
       const base64 = uint8ArrayToBase64(bytes);
@@ -186,6 +192,11 @@ export class ThermalPrinterAdapter implements PrinterAdapter {
       }
 
       const bytes = buildTestThermalReceipt();
+      
+      if (__DEV__) {
+        console.log('=== THERMAL TEST RECEIPT DEBUG ===\n' + debugEscPos(bytes) + '=============================');
+      }
+
       const base64 = uint8ArrayToBase64(bytes);
       await BluetoothThermalPrinter.writeBytes(base64);
 

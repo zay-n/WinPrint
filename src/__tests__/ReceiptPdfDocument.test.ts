@@ -3,6 +3,7 @@ import * as path from 'path';
 import {parseCsv} from '../services/csv/CsvReader';
 import {groupTransactions} from '../services/csv/TransactionGrouper';
 import {buildReceiptPdf} from '../services/pdf/ReceiptPdfDocument';
+import {DEFAULT_BUSINESS_PROFILE, DEFAULT_A4_TEMPLATE} from '../models/Profile';
 
 const TEST1_CSV = fs.readFileSync(path.resolve(__dirname, '../../test1.csv'), 'utf8');
 
@@ -28,5 +29,24 @@ describe('ReceiptPdfDocument', () => {
     const pdf = buildReceiptPdf(receipt);
 
     expect(pdf).toContain('Bearing \\(front\\) \\\\ special');
+  });
+
+  test('respects A4Template column visibility configuration in headers and data rows', () => {
+    const receipt = groupTransactions(parseCsv(TEST1_CSV).rows)[0];
+    const template = {
+      ...DEFAULT_A4_TEMPLATE,
+      showQuantity: false,
+      showDiscount: false,
+    };
+    const pdf = buildReceiptPdf(receipt, DEFAULT_BUSINESS_PROFILE, template);
+
+    // QTY header and data should not be present
+    expect(pdf).not.toContain('(QTY)');
+    expect(pdf).not.toContain('(DISC.)');
+    
+    // Other headers should still be present
+    expect(pdf).toContain('(DESCRIPTION)');
+    expect(pdf).toContain('(RATE)');
+    expect(pdf).toContain('(AMOUNT)');
   });
 });

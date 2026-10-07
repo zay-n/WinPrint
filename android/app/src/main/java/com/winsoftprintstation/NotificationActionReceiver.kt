@@ -23,19 +23,21 @@ class NotificationActionReceiver : BroadcastReceiver() {
 
         val fileId = intent.getStringExtra(WinsoftFcmService.EXTRA_FILE_ID) ?: return
         val folderId = intent.getStringExtra(WinsoftFcmService.EXTRA_FOLDER_ID) ?: ""
+        val fileName = intent.getStringExtra(WinsoftFcmService.EXTRA_FILE_NAME) ?: ""
 
         // Dismiss the notification
         val notificationId = fileId.hashCode()
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.cancel(notificationId)
 
-        // Persist deferred file ID
+        // Persist deferred file ID (including fileName when available)
         val prefs = context.getSharedPreferences(WinsoftFcmService.PREFS_NAME, Context.MODE_PRIVATE)
         val existing = prefs.getStringSet("deferred_files", mutableSetOf()) ?: mutableSetOf()
-        val updated = existing.toMutableSet().apply { add("$fileId::$folderId") }
+        val entry = if (fileName.isNotBlank()) "$fileId::$folderId::$fileName" else "$fileId::$folderId"
+        val updated = existing.toMutableSet().apply { add(entry) }
         prefs.edit().putStringSet("deferred_files", updated).apply()
 
         // Emit RN event if the bridge is alive
-        MonitoringEventBus.emitLaterAction(fileId, folderId)
+        MonitoringEventBus.emitLaterAction(fileId, folderId, fileName)
     }
 }

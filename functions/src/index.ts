@@ -50,13 +50,26 @@ const db = admin.firestore();
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface DeviceRecord {
+  uid?: string;
+  userEmail?: string;
+  businessId?: string;
+  deviceId?: string;
+  platform?: string;
+  appVersion?: string;
   fcmToken: string;
   folderId: string;
+  folderName?: string;
   channelId: string;
   resourceId: string;
   pageToken: string;
   expiration: number; // Unix ms
-  registeredAt: admin.firestore.Timestamp;
+  monitoringStatus?: string;
+  monitoringEnabled?: boolean;
+  disabled?: boolean;
+  lastMonitoringEvent?: string;
+  lastSeenAt?: admin.firestore.FieldValue | admin.firestore.Timestamp;
+  registeredAt?: admin.firestore.FieldValue | admin.firestore.Timestamp;
+  updatedAt?: admin.firestore.FieldValue | admin.firestore.Timestamp;
 }
 
 interface ServiceAccount {
@@ -115,7 +128,7 @@ async function driveGetStartPageToken(
   auth: string,
 ): Promise<string> {
   const resp = await fetch(
-    `${DRIVE_BASE}/changes/startPageToken`,
+    `${DRIVE_BASE}/changes/startPageToken?supportsAllDrives=true`,
     {headers: {Authorization: auth}},
   );
   if (!resp.ok) {
@@ -150,7 +163,7 @@ async function driveWatchChanges(
     expiration: String(Date.now() + ttlMs),
   };
   const resp = await fetch(
-    `${DRIVE_BASE}/changes/watch?pageToken=${pageToken}`,
+    `${DRIVE_BASE}/changes/watch?pageToken=${pageToken}&supportsAllDrives=true&includeItemsFromAllDrives=true`,
     {
       method: "POST",
       headers: {
@@ -207,7 +220,7 @@ async function driveListChanges(
   const fields = "changes(fileId,file(name,parents,mimeType,trashed)),nextPageToken,newStartPageToken";
   const url =
     `${DRIVE_BASE}/changes?pageToken=${pageToken}` +
-    `&fields=${fields}&includeRemoved=false`;
+    `&fields=${fields}&includeRemoved=false&supportsAllDrives=true&includeItemsFromAllDrives=true`;
   const resp = await fetch(url, {headers: {Authorization: auth}});
   if (!resp.ok) throw new Error(`changes.list failed: ${resp.status}`);
   return resp.json() as Promise<ChangesListResponse>;
@@ -282,9 +295,28 @@ export const registerdevice = onRequest(
       return;
     }
 
-    const {fcmToken, folderId} = req.body as {
+    const {
+      fcmToken,
+      folderId,
+      folderName,
+      uid,
+      userEmail,
+      businessId,
+      platform,
+      appVersion,
+      deviceId,
+      forceRefresh,
+    } = req.body as {
       fcmToken?: string;
       folderId?: string;
+      folderName?: string;
+      uid?: string;
+      userEmail?: string;
+      businessId?: string;
+      platform?: string;
+      appVersion?: string;
+      deviceId?: string;
+      forceRefresh?: boolean;
     };
 
     if (!fcmToken || !folderId) {
@@ -298,34 +330,127 @@ export const registerdevice = onRequest(
       const client = getDriveClient(sa);
       const auth = await authHeader(client);
 
+      // Verify folder exists and service account has access to it
+      const folderCheckResp = await fetch(
+        `${DRIVE_BASE}/files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=id,name,mimeType,trashed`,
+        {headers: {Authorization: auth}},
+      );
+
+      if (folderCheckResp.status === 404 || folderCheckResp.status === 403) {
+        logger.warn("[RegisterDevice] Folder not accessible by service account", {
+          folderId,
+          serviceAccountEmail: sa.client_email,
+        });
+        res.status(403).json({
+          error: "FOLDER_NOT_SHARED",
+          serviceAccountEmail: sa.client_email,
+          message: `Incoming folder is not accessible by the monitoring account (${sa.client_email}). Please share the folder with this email as Viewer.`,
+        });
+        return;
+      }
+
+      if (!folderCheckResp.ok) {
+        const errText = await folderCheckResp.text();
+        logger.error("[RegisterDevice] Folder check failed", {status: folderCheckResp.status, errText});
+        res.status(folderCheckResp.status).json({
+          error: "DRIVE_API_ERROR",
+          message: `Google Drive API error checking folder: ${folderCheckResp.statusText}`,
+        });
+        return;
+      }
+
+      const folderInfo = (await folderCheckResp.json()) as {
+        id: string;
+        name?: string;
+        mimeType?: string;
+        trashed?: boolean;
+      };
+
+      if (folderInfo.trashed) {
+        res.status(400).json({
+          error: "FOLDER_TRASHED",
+          message: "The configured Incoming folder is in Google Drive trash.",
+        });
+        return;
+      }
+
       // Webhook URL: project-specific, not derived from request host.
       const projectId = process.env.GCLOUD_PROJECT ?? "winprint-8a644";
       const webhookUrl =
         `https://asia-southeast1-${projectId}.cloudfunctions.net/drivewebhook`;
 
-      // Check if a device is already registered for this folder
-      const existing = await db
-        .collection("devices")
-        .where("folderId", "==", folderId)
-        .where("fcmToken", "==", fcmToken)
-        .limit(1)
-        .get();
+      // Determine document reference: prefer stable UID if provided
+      let deviceDocRef: FirebaseFirestore.DocumentReference;
+      let existingData: DeviceRecord | null = null;
 
-      if (!existing.empty) {
-        const doc = existing.docs[0];
-        const data = doc.data() as DeviceRecord;
-        // If existing channel still has > 1 hour remaining, reuse it
-        if (data.expiration - Date.now() > 60 * 60 * 1000) {
-          res.status(200).json({
-            ok: true, serviceAccountEmail: sa.client_email,
-          });
-          return;
+      if (uid) {
+        deviceDocRef = db.collection("devices").doc(uid);
+        const docSnap = await deviceDocRef.get();
+        if (docSnap.exists) {
+          existingData = docSnap.data() as DeviceRecord;
         }
-        // Stop the old channel (best effort) and re-register
+      } else {
+        const byToken = await db
+          .collection("devices")
+          .where("fcmToken", "==", fcmToken)
+          .limit(1)
+          .get();
+        if (!byToken.empty) {
+          deviceDocRef = byToken.docs[0].ref;
+          existingData = byToken.docs[0].data() as DeviceRecord;
+        } else {
+          deviceDocRef = db.collection("devices").doc();
+        }
+      }
+
+      // If existing channel is active (> 2 hours remaining), same folder, and not forceRefresh:
+      if (
+        !forceRefresh &&
+        existingData &&
+        existingData.folderId === folderId &&
+        existingData.channelId &&
+        existingData.expiration - Date.now() > 2 * 60 * 60 * 1000
+      ) {
+        await deviceDocRef.set({
+          fcmToken,
+          folderId,
+          folderName: folderInfo.name || folderName || existingData.folderName || "",
+          uid: uid || existingData.uid || "",
+          userEmail: userEmail || existingData.userEmail || "",
+          businessId: businessId || existingData.businessId || "",
+          deviceId: deviceId || existingData.deviceId || "",
+          platform: platform || existingData.platform || "android",
+          appVersion: appVersion || existingData.appVersion || "1.0.0",
+          monitoringStatus: "connected",
+          monitoringEnabled: true,
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+
+        logger.info("[RegisterDevice] Existing active watch preserved", {
+          folderId,
+          channelId: existingData.channelId,
+        });
+
+        res.status(200).json({
+          ok: true,
+          serviceAccountEmail: sa.client_email,
+          channelId: existingData.channelId,
+          expiration: existingData.expiration,
+          status: "connected",
+        });
+        return;
+      }
+
+      // Stop old channel if changing folder, expired, or forceRefresh
+      if (existingData?.channelId && existingData?.resourceId) {
         try {
-          await driveStopChannel(auth, data.channelId, data.resourceId);
+          await driveStopChannel(auth, existingData.channelId, existingData.resourceId);
+          logger.info("[RegisterDevice] Stopped previous watch channel", {
+            channelId: existingData.channelId,
+          });
         } catch (e) {
-          logger.warn("Could not stop old channel", {error: String(e)});
+          logger.warn("[RegisterDevice] Could not stop previous channel", {error: String(e)});
         }
       }
 
@@ -341,26 +466,45 @@ export const registerdevice = onRequest(
         webhookUrl,
       );
 
-      // Upsert device record
-      const deviceRef = existing.empty ?
-        db.collection("devices").doc() :
-        existing.docs[0].ref;
-
-      await deviceRef.set({
+      // Upsert full device record
+      await deviceDocRef.set({
         fcmToken,
         folderId,
+        folderName: folderInfo.name || folderName || "",
+        uid: uid || "",
+        userEmail: userEmail || "",
+        businessId: businessId || "",
+        deviceId: deviceId || "",
+        platform: platform || "android",
+        appVersion: appVersion || "1.0.0",
         channelId,
         resourceId,
         pageToken,
         expiration,
+        monitoringStatus: "connected",
+        monitoringEnabled: true,
+        disabled: false,
         registeredAt: admin.firestore.FieldValue.serverTimestamp(),
-      } as Partial<DeviceRecord>);
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
 
-      logger.info("Device registered", {folderId, channelId});
-      res.status(200).json({ok: true, serviceAccountEmail: sa.client_email});
+      logger.info("[RegisterDevice] Device registered with fresh watch", {
+        folderId,
+        channelId,
+        docId: deviceDocRef.id,
+      });
+
+      res.status(200).json({
+        ok: true,
+        serviceAccountEmail: sa.client_email,
+        channelId,
+        expiration,
+        status: "connected",
+      });
     } catch (e) {
       const msg = String(e);
-      logger.error("registerdevice failed", {error: msg});
+      logger.error("[RegisterDevice] Registration failed", {error: msg});
       res.status(500).json({error: msg});
     }
   },
@@ -407,13 +551,24 @@ export const drivewebhook = onRequest(
       .get();
 
     if (snap.empty) {
-      logger.warn("No device for channelId", {channelId});
+      logger.warn("[DriveWebhook] No device for channelId", {
+        channelId: channelId ? `${channelId.slice(0, 8)}...` : "none",
+      });
       res.status(200).end(); // Acknowledge to prevent retries
       return;
     }
 
     const docRef = snap.docs[0].ref;
     const device = snap.docs[0].data() as DeviceRecord;
+
+    // Check if device monitoring has been revoked by admin
+    if (device.disabled === true) {
+      logger.info("[DriveWebhook] Device is disabled by admin, skipping push", {
+        uid: device.uid,
+      });
+      res.status(200).end();
+      return;
+    }
 
     // Fetch Drive changes using the service account
     const saJson = serviceAccountSecret.value();
@@ -430,18 +585,39 @@ export const drivewebhook = onRequest(
       const changes = await driveListChanges(auth, pageToken);
 
       for (const change of changes.changes ?? []) {
-        if (change.removed || !change.file) continue;
-        const {file} = change;
+        if (change.removed) continue;
+        let file = change.file;
+
+        // Fallback: If delta entry lacks complete file or parents, fetch metadata
+        if (!file || !file.parents) {
+          try {
+            const metaResp = await fetch(
+              `${DRIVE_BASE}/files/${change.fileId}?supportsAllDrives=true&fields=id,name,parents,mimeType,trashed`,
+              {headers: {Authorization: auth}},
+            );
+            if (metaResp.ok) {
+              file = (await metaResp.json()) as typeof change.file;
+            }
+          } catch (e) {
+            logger.warn("[DriveWebhook] Fallback metadata check failed", {
+              fileId: change.fileId,
+              error: String(e),
+            });
+          }
+        }
+
+        if (!file) continue;
 
         // Only care about CSVs in the registered Incoming folder
         const isInFolder = file.parents?.includes(device.folderId);
         const isCsv =
           file.mimeType === "text/csv" ||
           file.mimeType === "text/plain" ||
+          file.mimeType === "application/vnd.ms-excel" ||
           (file.name ?? "").toLowerCase().endsWith(".csv");
 
         if (isInFolder && isCsv && !file.trashed) {
-          newCsvFiles.push({id: change.fileId, name: file.name ?? ""});
+          newCsvFiles.push({id: change.fileId, name: file.name ?? "Winsoft Bill"});
         }
       }
 
@@ -453,8 +629,14 @@ export const drivewebhook = onRequest(
       }
     }
 
-    // Save the advanced page token
-    await docRef.update({pageToken});
+    // Save the advanced page token and update device status
+    await docRef.update({
+      pageToken,
+      lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(newCsvFiles.length > 0
+        ? {lastMonitoringEvent: `CSV: ${newCsvFiles[0].name} (${new Date().toLocaleTimeString()})`}
+        : {}),
+    });
 
     // Send FCM notifications for each new CSV
     for (const file of newCsvFiles) {
@@ -465,9 +647,13 @@ export const drivewebhook = onRequest(
           file.name,
           device.folderId,
         );
-        logger.info("FCM sent", {fileId: file.id, fileName: file.name});
+        logger.info("[DriveWebhook] FCM notification dispatched", {
+          fileId: file.id,
+          fileName: file.name,
+          tokenSuffix: device.fcmToken ? `...${device.fcmToken.slice(-6)}` : "none",
+        });
       } catch (e) {
-        logger.error("FCM send failed", {
+        logger.error("[DriveWebhook] FCM send failed", {
           fileId: file.id,
           error: String(e),
         });

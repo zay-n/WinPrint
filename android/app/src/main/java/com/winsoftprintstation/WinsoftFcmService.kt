@@ -134,6 +134,7 @@ class WinsoftFcmService : FirebaseMessagingService() {
             action = ACTION_LATER
             putExtra(EXTRA_FILE_ID, fileId)
             putExtra(EXTRA_FOLDER_ID, folderId)
+            putExtra(EXTRA_FILE_NAME, fileName)
         }
         val laterPendingIntent = PendingIntent.getBroadcast(
             this,

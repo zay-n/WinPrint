@@ -25,6 +25,7 @@ export default function ReceiptPreviewScreen({route}: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
+  const [cacheBuster] = useState(() => Date.now());
 
   useEffect(() => {
     let active = true;
@@ -97,7 +98,7 @@ export default function ReceiptPreviewScreen({route}: Props) {
         {pageUris.map((uri, index) => (
           <View key={uri} style={styles.pageCard}>
             <Text style={styles.pageLabel}>Page {index + 1}</Text>
-            <Image source={{uri}} style={styles.pageImage} resizeMode="contain" accessibilityLabel={`Receipt PDF page ${index + 1}`} />
+            <Image source={{uri: `${uri}?t=${cacheBuster}`}} style={styles.pageImage} resizeMode="contain" accessibilityLabel={`Receipt PDF page ${index + 1}`} />
           </View>
         ))}
       </ScrollView>

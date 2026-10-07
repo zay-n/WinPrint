@@ -46,6 +46,8 @@ export type HistoryStackParamList = {
 
 export type SettingsStackParamList = {
   SettingsHome: undefined;
+  BusinessSetup: undefined;
+  AdminAccess: undefined;
 };
 
 // ─── Composite screen props helpers ──────────────────────────────────────────
@@ -78,7 +80,7 @@ export type SettingsScreenProps = CompositeScreenProps<
 // ─── Global navigation type augmentation ─────────────────────────────────────
 
 declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
+   
   namespace ReactNavigation {
     interface RootParamList extends RootTabParamList {}
   }

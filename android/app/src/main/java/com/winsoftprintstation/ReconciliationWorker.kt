@@ -57,9 +57,8 @@ class ReconciliationWorker(
         val deferred = prefs.getStringSet("deferred_files", emptySet()) ?: emptySet()
         if (deferred.isNotEmpty()) {
             MonitoringEventBus.emitDeferredFilesReady(deferred.toList())
-            // Clear after handing off to RN — if RN fails, MonitoringService
-            // is responsible for re-persisting via store.addDeferredFileId().
-            prefs.edit().remove("deferred_files").apply()
+            // Do not delete here. React Native acknowledges receipt via clearDeferredFiles()
+            // once persisted to app storage, preventing data loss.
         }
 
         Result.success()

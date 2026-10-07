@@ -45,10 +45,13 @@ object MonitoringEventBus {
         safeEmit("onPrintActionReceived", map)
     }
 
-    fun emitLaterAction(fileId: String, folderId: String) {
+    fun emitLaterAction(fileId: String, folderId: String, fileName: String = "") {
         val map = com.facebook.react.bridge.Arguments.createMap().apply {
             putString("fileId", fileId)
             putString("folderId", folderId)
+            if (fileName.isNotBlank()) {
+                putString("fileName", fileName)
+            }
         }
         safeEmit("onLaterActionReceived", map)
     }

@@ -3,28 +3,14 @@
  *
  * Wraps @react-native-google-signin/google-signin.
  *
- * SETUP REQUIRED (you must perform this manually):
- *
- *  1. Go to https://console.cloud.google.com/
- *  2. Create a new project (or select existing).
- *  3. Enable "Google Drive API".
- *  4. Configure OAuth consent screen:
- *       - User Type: External
- *       - Add scope: https://www.googleapis.com/auth/drive.readonly
- *  5. Create an Android OAuth 2.0 Client ID:
- *       - Application type: Android
- *       - Package name: com.winsoftprintstation
- *       - SHA-1 certificate fingerprint: run in project root:
- *           cd android && .\gradlew signingReport
- *         Copy the SHA1 under ":app > Variant: debug > Store: ~/.android/debug.keystore"
- *  6. Create a Web OAuth 2.0 Client ID:
- *       - Application type: Web application
- *       - Copy the Client ID (looks like: XXXXXXX.apps.googleusercontent.com)
- *  7. Replace the WEB_CLIENT_ID placeholder below with your Web Client ID.
- *
- * NOTE: google-services.json is NOT required (we are not using Firebase).
- *       The Android Client ID is registered only for SHA-1 verification.
- *       The Web Client ID is what we pass to GoogleSignin.configure().
+ * Configuration:
+ *  - webClientId: The Web OAuth 2.0 Client ID from Google Cloud Console.
+ *    This is the client_type:3 entry in google-services.json.
+ *    It is used by requestIdToken() to get the ID token for Firebase Auth.
+ *  - The Android OAuth client (client_type:1) in google-services.json must
+ *    have the app's signing certificate SHA-1 registered.
+ *    Debug SHA-1:   5E:8F:16:06:2E:A3:CD:2C:4A:0D:54:78:76:BA:A6:F3:8C:AB:F6:25
+ *    Release SHA-1: C6:D1:EA:87:36:38:3D:99:E6:22:76:E2:C4:17:58:46:CE:27:1B:91
  */
 
 import {
@@ -34,9 +20,11 @@ import {
 } from '@react-native-google-signin/google-signin';
 
 // ---------------------------------------------------------------------------
-// TODO: Replace with your Web Client ID from Google Cloud Console
+// Web Client ID — from google-services.json (client_type:3)
+// This is the single source of truth for the web client ID.
 // ---------------------------------------------------------------------------
-const WEB_CLIENT_ID = '856705756174-hlaortv29fn08r57r8kh7goh3v0f1s10.apps.googleusercontent.com';
+const WEB_CLIENT_ID =
+  '270826652071-0nd7ju81r4ets6gfdh41ld2b226h37nr.apps.googleusercontent.com';
 
 // ---------------------------------------------------------------------------
 // Drive scope required for reading CSV files
@@ -59,6 +47,8 @@ export interface AuthResult {
   user: GoogleUser;
   /** OAuth access token — used for Drive API calls. */
   accessToken: string;
+  /** Google ID token — used for Firebase Authentication. */
+  idToken: string;
 }
 
 export interface AuthError {
@@ -66,18 +56,16 @@ export interface AuthError {
   message: string;
 }
 
-let _configured = false;
-
-function ensureConfigured(): void {
-  if (_configured) {
-    return;
-  }
+/**
+ * Configure Google Sign-In. Safe to call multiple times.
+ * Always re-applies configuration so stale state cannot persist.
+ */
+export function configure(): void {
   GoogleSignin.configure({
     webClientId: WEB_CLIENT_ID,
     scopes: [DRIVE_READONLY_SCOPE],
     offlineAccess: false,
   });
-  _configured = true;
 }
 
 /**
@@ -85,15 +73,27 @@ function ensureConfigured(): void {
  * Returns AuthResult on success or throws AuthError.
  */
 export async function signIn(): Promise<AuthResult> {
-  ensureConfigured();
+  configure();
 
   try {
     await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
     const userInfo = await GoogleSignin.signIn();
     if (!isSuccessResponse(userInfo)) {
-      throw {code: statusCodes.SIGN_IN_CANCELLED, message: 'Sign-in was cancelled.'};
+      throw { code: statusCodes.SIGN_IN_CANCELLED, message: 'Sign-in was cancelled.' };
     }
     const tokens = await GoogleSignin.getTokens();
+
+    const idToken = userInfo.data.idToken;
+    if (!idToken) {
+      // Log even in release — this is a configuration error, not a user action
+      console.error('[WinPrint][GoogleAuth] CRITICAL: Google Sign-In succeeded but returned no idToken.');
+      console.error('[WinPrint][GoogleAuth] Check that the Web Client ID is registered in Google Cloud Console');
+      console.error('[WinPrint][GoogleAuth] and that offlineAccess is false when using requestIdToken.');
+      throw {
+        code: 'NO_ID_TOKEN',
+        message: 'Google Sign-In returned no ID token. Ensure the Web OAuth client is configured correctly.',
+      };
+    }
 
     return {
       user: {
@@ -103,8 +103,34 @@ export async function signIn(): Promise<AuthResult> {
         photo: userInfo.data.user.photo,
       },
       accessToken: tokens.accessToken,
+      idToken,
     };
   } catch (error: unknown) {
+    // Always log sign-in errors — they are needed for release debugging
+    const e = error as Record<string, unknown>;
+    const code = String(e?.code ?? 'unknown');
+    const nativeCode = String(e?.nativeErrorCode ?? '');
+    const msg = String(e?.message ?? error);
+
+    // Suppress expected user-cancellation noise
+    if (
+      code !== statusCodes.SIGN_IN_CANCELLED &&
+      code !== statusCodes.IN_PROGRESS &&
+      code !== 'CANCELLED'
+    ) {
+      console.error('[WinPrint][GoogleAuth] Sign-in error:');
+      console.error('  code:', code);
+      console.error('  nativeErrorCode:', nativeCode, '(10=DEVELOPER_ERROR, 12500=sign-in failed, 12501=cancelled)');
+      console.error('  message:', msg);
+      if (nativeCode === '10' || code === '10') {
+        console.error('[WinPrint][GoogleAuth] DEVELOPER_ERROR (10): This means the app signing certificate SHA-1');
+        console.error('[WinPrint][GoogleAuth]   is not registered in Google Cloud Console for this package.');
+        console.error('[WinPrint][GoogleAuth]   Debug SHA-1:   5E:8F:16:06:2E:A3:CD:2C:4A:0D:54:78:76:BA:A6:F3:8C:AB:F6:25');
+        console.error('[WinPrint][GoogleAuth]   Release SHA-1: C6:D1:EA:87:36:38:3D:99:E6:22:76:E2:C4:17:58:46:CE:27:1B:91');
+        console.error('[WinPrint][GoogleAuth]   Ensure BOTH are registered as separate Android OAuth clients at:');
+        console.error('[WinPrint][GoogleAuth]   https://console.cloud.google.com/apis/credentials');
+      }
+    }
     throw mapError(error);
   }
 }
@@ -113,7 +139,7 @@ export async function signIn(): Promise<AuthResult> {
  * Sign out and clear session.
  */
 export async function signOut(): Promise<void> {
-  ensureConfigured();
+  configure();
   try {
     await GoogleSignin.signOut();
   } catch (error: unknown) {
@@ -126,13 +152,19 @@ export async function signOut(): Promise<void> {
  * Returns null if not signed in.
  */
 export async function getCurrentUser(): Promise<AuthResult | null> {
-  ensureConfigured();
+  configure();
   try {
     const userInfo = GoogleSignin.getCurrentUser();
     if (!userInfo) {
       return null;
     }
     const tokens = await GoogleSignin.getTokens();
+    const idToken = userInfo.idToken;
+    if (!idToken) {
+      // Cannot restore session without an idToken — require fresh sign-in
+      console.warn('[WinPrint][GoogleAuth] getCurrentUser: no idToken available; requiring fresh sign-in.');
+      return null;
+    }
     return {
       user: {
         id: userInfo.user.id,
@@ -141,6 +173,7 @@ export async function getCurrentUser(): Promise<AuthResult | null> {
         photo: userInfo.user.photo ?? null,
       },
       accessToken: tokens.accessToken,
+      idToken,
     };
   } catch {
     return null;
@@ -152,7 +185,7 @@ export async function getCurrentUser(): Promise<AuthResult | null> {
  * Refreshes silently if needed.
  */
 export async function getAccessToken(): Promise<string | null> {
-  ensureConfigured();
+  configure();
   try {
     const tokens = await GoogleSignin.getTokens();
     return tokens.accessToken;
@@ -174,6 +207,7 @@ function mapError(error: unknown): AuthError {
     const e = error as { code: string; message?: string };
     switch (e.code) {
       case statusCodes.SIGN_IN_CANCELLED:
+      case 'CANCELLED':
         return { code: 'CANCELLED', message: 'Sign-in was cancelled by the user.' };
       case statusCodes.IN_PROGRESS:
         return { code: 'IN_PROGRESS', message: 'Sign-in is already in progress.' };
@@ -181,6 +215,14 @@ function mapError(error: unknown): AuthError {
         return {
           code: 'PLAY_SERVICES_UNAVAILABLE',
           message: 'Google Play Services is not available or needs updating.',
+        };
+      case '10':
+      case 'DEVELOPER_ERROR':
+        return {
+          code: 'DEVELOPER_ERROR',
+          message:
+            'Google Sign-In configuration error. The app signing certificate may not be registered. ' +
+            'Please contact support.',
         };
       default:
         return {

@@ -4,6 +4,7 @@ import {
   buildTestThermalReceipt,
 } from '../services/printer/escpos/EscPosReceiptBuilder';
 import type {Receipt} from '../models/Receipt';
+import {DEFAULT_BUSINESS_PROFILE, DEFAULT_THERMAL_TEMPLATE} from '../models/Profile';
 
 describe('EscPosBuilder', () => {
   it('initializes printer with ESC @', () => {
@@ -100,6 +101,37 @@ describe('EscPosBuilder', () => {
     const text = new TextDecoder().decode(builder.build());
     const line = text.slice(2).replace('\n', '');
     expect(line).toBe('='.repeat(48));
+  });
+
+  describe('textWrapped', () => {
+    it('handles short description without wrapping', () => {
+      const builder = new EscPosBuilder();
+      builder.textWrapped('1. Short Item', 48, 3);
+      const text = new TextDecoder().decode(builder.build()).slice(2);
+      expect(text).toBe('1. Short Item\n');
+    });
+
+    it('wraps long description and indents continuation lines', () => {
+      const builder = new EscPosBuilder();
+      const longStr = '1. Toyota Land Cruiser Front Brake Pad Assembly Genuine Replacement Premium';
+      builder.textWrapped(longStr, 48, 3);
+      const text = new TextDecoder().decode(builder.build()).slice(2);
+      const lines = text.split('\n');
+      expect(lines[0]).toBe('1. Toyota Land Cruiser Front Brake Pad Assembly');
+      expect(lines[1]).toBe('   Genuine Replacement Premium');
+      expect(lines[2]).toBe(''); // trailing from split
+    });
+
+    it('hard-splits oversized single words safely', () => {
+      const builder = new EscPosBuilder();
+      const oversized = '1. Supercalifragilisticexpialidocious_which_is_extremely_long';
+      builder.textWrapped(oversized, 20, 3);
+      const text = new TextDecoder().decode(builder.build()).slice(2);
+      const lines = text.split('\n');
+      expect(lines[0].length).toBeLessThanOrEqual(20);
+      expect(lines[1].length).toBeLessThanOrEqual(20);
+      expect(lines[1].startsWith('   ')).toBe(true);
+    });
   });
 });
 
@@ -243,5 +275,54 @@ describe('EscPosReceiptBuilder', () => {
     expect(text).toContain('10.00');
     expect(text).not.toContain('undefined');
     expect(text).not.toContain('NaN');
+  });
+
+  it('respects ThermalTemplate visibility configurations', () => {
+    const customTemplate = {
+      ...DEFAULT_THERMAL_TEMPLATE,
+      showQuantity: false,
+      showItemTotal: false,
+      showSubtotal: false,
+      showGrandTotal: false,
+    };
+    const bytes = buildThermalReceipt(sampleReceipt, DEFAULT_BUSINESS_PROFILE, customTemplate);
+    const text = new TextDecoder().decode(bytes);
+
+    // Default template included these
+    expect(text).not.toContain('2 PCS x 250.00'); // Quantity shouldn't be formatted like this if off
+    expect(text).not.toContain('Subtotal');
+    expect(text).not.toContain('TOTAL');
+  });
+
+  it('wraps long item descriptions and keeps numeric row separate', () => {
+    const receiptWithLongItem: Receipt = {
+      ...sampleReceipt,
+      items: [
+        {
+          sourceFields: {item: 'CODE-99'},
+          description: 'A very incredibly long description that absolutely needs to wrap to the next line',
+          quantity: 2,
+          rate: 100,
+          amount: 200,
+        },
+      ],
+    };
+
+    const template = {
+      ...DEFAULT_THERMAL_TEMPLATE,
+      showItemCode: true,
+      showItemDescription: true,
+    };
+
+    const bytes = buildThermalReceipt(receiptWithLongItem, DEFAULT_BUSINESS_PROFILE, template);
+    const text = new TextDecoder().decode(bytes);
+
+    // Should wrap nicely and include the code
+    expect(text).toContain('1. [CODE-99] A very incredibly long description');
+    expect(text).toContain('   that absolutely needs to wrap to the next');
+    expect(text).toContain('   line');
+    
+    // Numeric row should remain separate
+    expect(text).toContain('   2 x 100.00');
   });
 });

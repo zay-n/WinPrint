@@ -8,68 +8,68 @@
  */
 
 import type {Receipt, ReceiptItem} from '../../../models/Receipt';
+import {BusinessProfile, ThermalTemplate, DEFAULT_BUSINESS_PROFILE, DEFAULT_THERMAL_TEMPLATE} from '../../../models/Profile';
 import {EscPosBuilder} from './EscPosBuilder';
-
-export interface ThermalReceiptOptions {
-  businessName?: string;
-  businessAddress?: string;
-  businessPhone?: string;
-  businessTrn?: string;
-  footerMessage?: string;
-  paperWidth?: number; // default 48
-}
-
-const DEFAULT_OPTIONS: ThermalReceiptOptions = {
-  businessName: 'WINSOFT PRINT STATION',
-  businessAddress: 'Business Bay, Dubai, UAE',
-  footerMessage: 'Thank you for your business!',
-  paperWidth: EscPosBuilder.DEFAULT_80MM_WIDTH,
-};
 
 /**
  * Builds 80mm ESC/POS bytes from a normalized Receipt.
  */
 export function buildThermalReceipt(
   receipt: Receipt,
-  userOptions?: ThermalReceiptOptions,
+  profile?: BusinessProfile,
+  template?: ThermalTemplate,
 ): Uint8Array {
-  const options = {...DEFAULT_OPTIONS, ...userOptions};
-  const width = options.paperWidth ?? EscPosBuilder.DEFAULT_80MM_WIDTH;
+  const p = profile ?? DEFAULT_BUSINESS_PROFILE;
+  const t = template ?? DEFAULT_THERMAL_TEMPLATE;
+  const width = EscPosBuilder.DEFAULT_80MM_WIDTH;
   const builder = new EscPosBuilder();
 
-  // 1. Header (Centered)
-  builder.align('center');
-  builder.bold(true);
-  builder.textSize(2, 2);
-  builder.line(options.businessName);
+  if (t.fontMode === 'large') {
+    // EscPosBuilder doesn't have a direct global mode, but we can set double height for the whole receipt
+    // Actually, we'll just set double height for specific elements later or leave it normal.
+  }
+
+  // 1. Header
+  const hAlign = t.headerAlignment === 'left' ? 'left' : (t.headerAlignment === 'right' ? 'right' : 'center');
+  builder.align(hAlign);
+  
+  if (t.showBusinessName) {
+    builder.bold(true);
+    builder.textSize(2, 2);
+    builder.line(p.identity.businessName || 'WINSOFT PRINT STATION');
+  }
 
   builder.textSize(1, 1);
   builder.bold(false);
-  if (options.businessAddress) {
-    builder.line(options.businessAddress);
+  
+  if (t.showAddress && p.contact.addressLine1) {
+    builder.line(p.contact.addressLine1);
+    if (p.contact.addressLine2) builder.line(p.contact.addressLine2);
   }
-  if (options.businessPhone) {
-    builder.line(`Tel: ${options.businessPhone}`);
+  if (t.showPhone && p.contact.phone) {
+    builder.line(`Tel: ${p.contact.phone}`);
   }
-  if (options.businessTrn) {
-    builder.line(`TRN: ${options.businessTrn}`);
+  if (t.showTaxRegistration && p.tax.taxRegistrationNumber) {
+    builder.line(`${p.tax.taxRegistrationLabel || 'Tax ID'}: ${p.tax.taxRegistrationNumber}`);
   }
 
   builder.line();
   builder.bold(true);
   builder.textSize(1, 2);
-  builder.line(receipt.transactionType || 'TAX INVOICE');
+  builder.line(p.receiptDefaults.receiptTitle || 'TAX INVOICE');
   builder.textSize(1, 1);
   builder.bold(false);
 
   // 2. Transaction & Customer Info
   builder.align('left');
-  builder.separator('=', width);
-  builder.leftRight('Trans No:', receipt.transactionNumber || '-', width);
-  if (receipt.date) {
+  if (t.showSeparators) builder.separator('=', width);
+  
+  if (t.showInvoiceNumber) builder.leftRight('Trans No:', receipt.transactionNumber || '-', width);
+  if (t.showDateTime && receipt.date) {
     builder.leftRight('Date:', receipt.date, width);
   }
-  if (receipt.customer.name) {
+  
+  if (t.showCustomerName && receipt.customer.name) {
     builder.leftRight('Customer:', receipt.customer.name, width);
   }
   if (receipt.customer.phone) {
@@ -84,22 +84,25 @@ export function buildThermalReceipt(
   }
 
   // 3. Line Items Table (80mm 2-line layout)
-  builder.separator('=', width);
+  if (t.showSeparators) builder.separator('=', width);
   builder.bold(true);
+  
+  // A simplistic header for now (we'll keep it mostly standard for 80mm as it's hardcoded to standard layout)
   builder.leftRight('DESCRIPTION', 'QTY x RATE      AMOUNT', width);
   builder.bold(false);
-  builder.separator('-', width);
+  if (t.showSeparators) builder.separator('-', width);
 
   receipt.items.forEach((item, index) => {
-    formatThermalItem(builder, item, index + 1, width);
+    formatThermalItem(builder, item, index + 1, width, t);
   });
 
   // 4. Totals
-  builder.separator('=', width);
-  if (receipt.financials.subtotal !== undefined) {
+  if (t.showSeparators) builder.separator('=', width);
+  
+  if (t.showSubtotal && receipt.financials.subtotal !== undefined) {
     builder.leftRight('Subtotal', formatMoney(receipt.financials.subtotal), width);
   }
-  if (receipt.financials.discountAmount && receipt.financials.discountAmount > 0) {
+  if (t.showDiscount && receipt.financials.discountAmount && receipt.financials.discountAmount > 0) {
     builder.leftRight('Discount', `-${formatMoney(receipt.financials.discountAmount)}`, width);
   }
   if (receipt.financials.freight && receipt.financials.freight > 0) {
@@ -108,33 +111,39 @@ export function buildThermalReceipt(
   if (receipt.financials.taxableAmount !== undefined) {
     builder.leftRight('Taxable Amount', formatMoney(receipt.financials.taxableAmount), width);
   }
-  if (receipt.financials.vatAmount !== undefined) {
+  if (t.showVat && receipt.financials.vatAmount !== undefined) {
+    const taxLabel = p.receiptDefaults.defaultTaxLabel || 'VAT';
     const vatLabel = receipt.financials.vatRate !== undefined
-      ? `VAT (${receipt.financials.vatRate}%)`
-      : 'VAT';
+      ? `${taxLabel} (${receipt.financials.vatRate}%)`
+      : taxLabel;
     builder.leftRight(vatLabel, formatMoney(receipt.financials.vatAmount), width);
   }
   if (receipt.financials.rounding && receipt.financials.rounding !== 0) {
     builder.leftRight('Rounding', formatMoney(receipt.financials.rounding), width);
   }
 
-  builder.separator('-', width);
+  if (t.showSeparators) builder.separator('-', width);
 
   // Grand Total in Bold Double-Height
-  builder.bold(true);
-  builder.textSize(1, 2);
-  const totalAmount = receipt.financials.total !== undefined
-    ? formatMoney(receipt.financials.total)
-    : '0.00';
-  builder.leftRight('TOTAL', totalAmount, width);
-  builder.textSize(1, 1);
-  builder.bold(false);
+  if (t.showGrandTotal) {
+    builder.bold(true);
+    builder.textSize(1, 2);
+    const totalAmount = receipt.financials.total !== undefined
+      ? formatMoney(receipt.financials.total)
+      : '0.00';
+      
+    const curr = p.receiptDefaults.currencySymbol;
+    const pos = p.receiptDefaults.currencyPosition;
+    const totalWithCurrency = pos === 'before' ? `${curr} ${totalAmount}` : `${totalAmount} ${curr}`;
+    
+    builder.leftRight('TOTAL', totalWithCurrency, width);
+    builder.textSize(1, 1);
+    builder.bold(false);
+  }
 
   // 5. Additional Info
-  let hasAdditional = false;
   if (receipt.additional.salesman || receipt.additional.lpoNumber || receipt.additional.remarks) {
     builder.separator('-', width);
-    hasAdditional = true;
   }
   if (receipt.additional.salesman) {
     builder.leftRight('Salesman:', receipt.additional.salesman, width);
@@ -147,15 +156,14 @@ export function buildThermalReceipt(
   }
 
   // 6. Footer (Centered)
-  if (hasAdditional) {
-    builder.separator('=', width);
-  } else {
+  if (t.showSeparators) {
     builder.separator('=', width);
   }
 
   builder.align('center');
-  if (options.footerMessage) {
-    builder.line(options.footerMessage);
+  if (t.showFooter) {
+    const footerMsg = p.footer.footerMessage || 'Thank you for your business!';
+    builder.line(footerMsg);
   }
   builder.line('--- Winsoft Print Station ---');
 
@@ -219,10 +227,23 @@ function formatThermalItem(
   item: ReceiptItem,
   index: number,
   width: number,
+  t: ThermalTemplate,
 ): void {
-  const desc = item.description || `Item #${index}`;
+  let desc = '';
+  if (t.showItemCode && t.showItemDescription) {
+    const code = item.sourceFields?.item;
+    desc = code ? `[${code}] ${item.description || ''}` : (item.description || `Item #${index}`);
+  } else if (t.showItemDescription) {
+    desc = item.description || `Item #${index}`;
+  } else if (t.showItemCode) {
+    desc = item.sourceFields?.item || `Item #${index}`;
+  } else {
+    desc = `Item #${index}`;
+  }
+  
   builder.bold(true);
-  builder.line(`${index}. ${desc}`);
+  const prefix = `${index}. `;
+  builder.textWrapped(`${prefix}${desc}`, width, prefix.length);
   builder.bold(false);
 
   const qty = item.quantity !== undefined ? formatQty(item.quantity) : '1';
@@ -230,8 +251,20 @@ function formatThermalItem(
   const rate = item.rate !== undefined ? formatMoney(item.rate) : '0.00';
   const amount = item.amount !== undefined ? formatMoney(item.amount) : '0.00';
 
-  const leftDetails = `   ${qty}${unit} x ${rate}`;
-  builder.leftRight(leftDetails, amount, width);
+  let leftDetails = '';
+  if (t.showQuantity && t.showUnitPrice) {
+    leftDetails = `   ${qty}${unit} x ${rate}`;
+  } else if (t.showQuantity) {
+    leftDetails = `   ${qty}${unit}`;
+  } else if (t.showUnitPrice) {
+    leftDetails = `   Rate: ${rate}`;
+  }
+  
+  const rightTotal = t.showItemTotal ? amount : '';
+  
+  if (leftDetails || rightTotal) {
+    builder.leftRight(leftDetails, rightTotal, width);
+  }
 
   // Optional item details
   if (item.batch || item.expiryDate) {
@@ -246,7 +279,7 @@ function formatThermalItem(
     builder.line(`   Brand: ${item.brand}`);
   }
 
-  if (item.itemDiscount && item.itemDiscount > 0) {
+  if (t.showDiscount && item.itemDiscount && item.itemDiscount > 0) {
     builder.leftRight('   Item Discount', `-${formatMoney(item.itemDiscount)}`, width);
   }
 }

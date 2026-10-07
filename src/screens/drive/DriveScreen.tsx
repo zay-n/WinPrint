@@ -24,6 +24,7 @@ import {
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 import Icon from '../../components/Icon';
+import DriveFolderPickerModal from '../../components/DriveFolderPickerModal';
 import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
 import {useAppStore} from '../../store/useAppStore';
 import type {DriveFile} from '../../services/drive/DriveClient';
@@ -35,6 +36,7 @@ import type {DriveScreenProps} from '../../navigation/types';
 
 export default function DriveScreen({navigation}: DriveScreenProps) {
   const user = useAppStore(s => s.user);
+  const accessToken = useAppStore(s => s.accessToken);
   const signInLoading = useAppStore(s => s.signInLoading);
   const signInError = useAppStore(s => s.signInError);
   const signIn = useAppStore(s => s.signIn);
@@ -46,8 +48,10 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   const csvLoading = useAppStore(s => s.csvLoading);
   const sourceFolderId = useAppStore(s => s.sourceFolderId);
   const sourceFolderName = useAppStore(s => s.sourceFolderName);
+  const sourceFolderPath = useAppStore(s => s.sourceFolderPath);
   const archiveFolderId = useAppStore(s => s.archiveFolderId);
   const archiveFolderName = useAppStore(s => s.archiveFolderName);
+  const archiveFolderPath = useAppStore(s => s.archiveFolderPath);
   const driveError = useAppStore(s => s.driveError);
   const loadFolders = useAppStore(s => s.loadFolders);
   const selectFolder = useAppStore(s => s.selectFolder);
@@ -62,32 +66,12 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
 
   const [pickerMode, setPickerMode] = useState<'source' | 'archive' | null>(null);
 
-  // Load root folders when user signs in
+  // Automatically load CSV files when a source folder is configured
   useEffect(() => {
-    if (user) {
-      setPickerMode('source');
-      loadFolders('root');
+    if (user && sourceFolderId) {
+      void loadCsvFiles();
     }
-  }, [user, loadFolders]);
-
-  // Load CSV files when a folder is selected
-  useEffect(() => {
-    if (sourceFolderId) {
-      loadCsvFiles();
-    }
-  }, [sourceFolderId, loadCsvFiles]);
-
-  const handleFolderSelect = useCallback(
-    (folder: DriveFile) => {
-      if (pickerMode === 'archive') {
-        selectArchiveFolder(folder);
-      } else {
-        selectFolder(folder);
-      }
-      setPickerMode(null);
-    },
-    [pickerMode, selectFolder, selectArchiveFolder],
-  );
+  }, [user, sourceFolderId, loadCsvFiles]);
 
   const handleDownload = useCallback(
     (file: DriveFile) => {
@@ -182,79 +166,58 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
         ) : null}
 
         {/* Source Folder selection */}
-        <SectionLabel title="Select Source Folder" />
+        <SectionLabel title="Incoming Folder (Source)" />
         {sourceFolderName ? (
           <View style={styles.selectedFolder}>
             <Icon name="folder-google-drive" size={20} color="#4285F4" />
-            <Text style={styles.selectedFolderName} numberOfLines={1}>
-              {sourceFolderName}
-            </Text>
+            <View style={styles.folderTextContainer}>
+              <Text style={styles.selectedFolderName} numberOfLines={1}>
+                {sourceFolderName}
+              </Text>
+              {sourceFolderPath ? (
+                <Text style={styles.selectedFolderPath} numberOfLines={1}>
+                  {sourceFolderPath}
+                </Text>
+              ) : null}
+            </View>
             <Pressable
-              onPress={() => { setPickerMode('source'); loadFolders('root'); }}
+              onPress={() => setPickerMode('source')}
               style={styles.changeBtn}>
               <Text style={styles.changeBtnText}>Change</Text>
             </Pressable>
           </View>
         ) : (
-           <Pressable onPress={() => { setPickerMode('source'); loadFolders('root'); }} style={styles.changeBtnFull}>
-              <Text style={styles.changeBtnText}>Select Source Folder</Text>
+           <Pressable onPress={() => setPickerMode('source')} style={styles.changeBtnFull}>
+              <Text style={styles.changeBtnText}>Select Incoming Folder</Text>
            </Pressable>
         )}
 
         {/* Archive Folder selection */}
-        <SectionLabel title="Select Archive Folder (Printed)" />
+        <SectionLabel title="Printed Folder (Archive)" />
         {archiveFolderName ? (
           <View style={styles.selectedFolder}>
             <Icon name="folder-google-drive" size={20} color={Colors.active} />
-            <Text style={styles.selectedFolderName} numberOfLines={1}>
-              {archiveFolderName}
-            </Text>
+            <View style={styles.folderTextContainer}>
+              <Text style={styles.selectedFolderName} numberOfLines={1}>
+                {archiveFolderName}
+              </Text>
+              {archiveFolderPath ? (
+                <Text style={styles.selectedFolderPath} numberOfLines={1}>
+                  {archiveFolderPath}
+                </Text>
+              ) : null}
+            </View>
             <Pressable
-              onPress={() => { setPickerMode('archive'); loadFolders('root'); }}
+              onPress={() => setPickerMode('archive')}
               style={styles.changeBtn}>
               <Text style={styles.changeBtnText}>Change</Text>
             </Pressable>
           </View>
         ) : (
-           <Pressable onPress={() => { setPickerMode('archive'); loadFolders('root'); }} style={styles.changeBtnFull}>
-              <Text style={styles.changeBtnText}>Select Archive Folder</Text>
+           <Pressable onPress={() => setPickerMode('archive')} style={styles.changeBtnFull}>
+              <Text style={styles.changeBtnText}>Select Printed Folder</Text>
            </Pressable>
         )}
-
-        {pickerMode && foldersLoading ? (
-          <ActivityIndicator
-            color={Colors.primary}
-            style={styles.loader}
-          />
-        ) : pickerMode ? (
-          <View style={styles.folderPickerList}>
-            <Text style={styles.pickerHeader}>
-              Selecting {pickerMode === 'archive' ? 'Archive' : 'Source'} Folder...
-            </Text>
-            <FlatList
-              data={folders}
-              keyExtractor={f => f.id}
-              renderItem={({item}) => (
-                <FolderRow
-                  folder={item}
-                  selected={
-                    pickerMode === 'archive'
-                      ? item.id === archiveFolderId
-                      : item.id === sourceFolderId
-                  }
-                  onPress={() => handleFolderSelect(item)}
-                />
-              )}
-              scrollEnabled={false}
-              ListEmptyComponent={
-                <Text style={styles.emptyMsg}>No folders found at Drive root.</Text>
-              }
-              ItemSeparatorComponent={() => (
-                <View style={styles.separator} />
-              )}
-            />
-          </View>
-        ) : null}
 
         {/* CSV files */}
         {sourceFolderId ? (
@@ -329,6 +292,23 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
 
         <View style={styles.bottomPad} />
       </ScrollView>
+
+      {/* ── Nested Google Drive Folder Picker Modal ── */}
+      <DriveFolderPickerModal
+        visible={pickerMode !== null}
+        title={pickerMode === 'archive' ? 'Select Printed Folder' : 'Select Incoming Folder'}
+        accessToken={accessToken}
+        initialFolderId={pickerMode === 'archive' ? archiveFolderId : sourceFolderId}
+        initialFolderName={pickerMode === 'archive' ? archiveFolderName : sourceFolderName}
+        onSelect={folder => {
+          if (pickerMode === 'archive') {
+            selectArchiveFolder(folder);
+          } else {
+            void selectFolder(folder);
+          }
+        }}
+        onClose={() => setPickerMode(null)}
+      />
     </SafeAreaView>
   );
 }
@@ -537,7 +517,17 @@ const styles = StyleSheet.create({
   selectedFolderName: {
     ...Typography.body,
     color: Colors.primaryLight,
+    fontWeight: '600',
+  },
+  folderTextContainer: {
     flex: 1,
+    justifyContent: 'center',
+  },
+  selectedFolderPath: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
+    fontSize: 11,
+    marginTop: 2,
   },
   changeBtn: {
     paddingHorizontal: Spacing.sm,

@@ -7,6 +7,7 @@
  */
 
 import type {Receipt} from '../../models/Receipt';
+import {BusinessProfile, A4Template, DEFAULT_BUSINESS_PROFILE, DEFAULT_A4_TEMPLATE} from '../../models/Profile';
 
 const PAGE_WIDTH = 595;
 const PAGE_HEIGHT = 842;
@@ -16,17 +17,37 @@ const FOOTER_Y = 34;
 
 type Page = {commands: string[]; y: number};
 
-export function buildReceiptPdf(receipt: Receipt): string {
+export function buildReceiptPdf(
+  receipt: Receipt,
+  profile?: BusinessProfile,
+  template?: A4Template,
+): string {
+  const p = profile ?? DEFAULT_BUSINESS_PROFILE;
+  const t = template ?? DEFAULT_A4_TEMPLATE;
+
   const pages: Page[] = [];
   let page!: Page;
 
   const startPage = (continued = false) => {
     page = {commands: [], y: 735};
     page.commands.push(rect(0, 770, PAGE_WIDTH, 72, '#1A1D2E'));
-    page.commands.push(text(LEFT, 812, 'WINSOFT PRINT STATION', 18, true, '#F1F5F9'));
-    page.commands.push(text(LEFT, 791, 'Receipt / Tax Invoice', 10, false, '#94A3B8'));
+    
+    // Header Alignment Logic
+    const alignMap = { left: LEFT, center: PAGE_WIDTH / 2, right: RIGHT };
+    const hAlign = t.headerAlignment;
+    const anchorX = alignMap[hAlign];
+
+    if (t.showBusinessName) {
+      page.commands.push(text(anchorX, 812, p.identity.businessName || 'WINSOFT PRINT STATION', 18, true, '#F1F5F9', hAlign));
+    }
+    
+    const subtitle = p.receiptDefaults.receiptTitle || 'Receipt / Tax Invoice';
+    page.commands.push(text(anchorX, 791, subtitle, 10, false, '#94A3B8', hAlign));
+    
     page.commands.push(text(RIGHT - 142, 808, continued ? 'CONTINUED' : 'PARSED RECEIPT', 9, true, '#8B84FF'));
-    page.commands.push(text(RIGHT - 142, 790, `${receipt.transactionType} - ${receipt.transactionNumber}`, 11, true, '#F1F5F9'));
+    if (t.showInvoiceNumber) {
+      page.commands.push(text(RIGHT - 142, 790, `${receipt.transactionType} - ${receipt.transactionNumber}`, 11, true, '#F1F5F9'));
+    }
     pages.push(page);
   };
 
@@ -59,22 +80,40 @@ export function buildReceiptPdf(receipt: Receipt): string {
   };
 
   startPage();
-  section('Transaction');
-  detailRow('Transaction', `${receipt.transactionType} / ${receipt.transactionNumber}`);
-  detailRow('Date', receipt.date);
-  detailRow('Source file', receipt.sourceFile?.driveFileName);
-  divider();
+  
+  // Business Address / Contact details if centered or right, we can show them in a block,
+  // but for now, they can be part of the header or a separate section. 
+  // Let's add them to the top if needed.
+  if (t.showAddress || t.showPhone || t.showEmail || t.showTaxRegistration) {
+    section('Business Details');
+    if (t.showAddress) detailRow('Address', joinValues([p.contact.addressLine1, p.contact.addressLine2, p.contact.city, p.contact.country]));
+    if (t.showPhone) detailRow('Phone', joinValues([p.contact.phone, p.contact.mobile]));
+    if (t.showEmail) detailRow('Email', p.contact.email);
+    if (t.showTaxRegistration && p.tax.taxRegistrationNumber) detailRow(p.tax.taxRegistrationLabel || 'Tax ID', p.tax.taxRegistrationNumber);
+    if (t.showSeparators) divider();
+  }
 
-  section('Bill To');
-  detailRow('Customer', receipt.customer.name);
-  detailRow('Address', joinValues([receipt.customer.address1, receipt.customer.address2]));
-  detailRow('Location', joinValues([receipt.customer.city, receipt.customer.country]));
-  detailRow('Phone', receipt.customer.phone);
-  detailRow('TRN', receipt.additional.trn);
-  divider();
+  section('Transaction');
+  if (t.showInvoiceNumber) detailRow('Transaction', `${receipt.transactionType} / ${receipt.transactionNumber}`);
+  if (t.showDate) detailRow('Date', receipt.date);
+  detailRow('Source file', receipt.sourceFile?.driveFileName);
+  if (t.showSalesman && receipt.additional.salesman) detailRow('Salesman', receipt.additional.salesman);
+  if (t.showSeparators) divider();
+
+  if (t.showCustomerName || t.showCustomerAddress || t.showCustomerPhone) {
+    section('Bill To');
+    if (t.showCustomerName) detailRow('Customer', receipt.customer.name);
+    if (t.showCustomerAddress) {
+      detailRow('Address', joinValues([receipt.customer.address1, receipt.customer.address2]));
+      detailRow('Location', joinValues([receipt.customer.city, receipt.customer.country]));
+    }
+    if (t.showCustomerPhone) detailRow('Phone', receipt.customer.phone);
+    if (receipt.additional.trn) detailRow('Customer TRN', receipt.additional.trn);
+    if (t.showSeparators) divider();
+  }
 
   section('Line Items');
-  tableHeader(page);
+  tableHeader(page, t);
   page.y -= 18;
 
   receipt.items.forEach((item, itemIndex) => {
@@ -82,37 +121,37 @@ export function buildReceiptPdf(receipt: Receipt): string {
     const rowHeight = Math.max(24, descriptionLines.length * 11 + 10);
     ensureSpace(rowHeight + 4);
     if (page.y === 735) {
-      tableHeader(page);
+      tableHeader(page, t);
       page.y -= 18;
     }
-descriptionLines.forEach((description, lineIndex) => {
-  page.commands.push(
-    text(
-      LEFT,
-      page.y - lineIndex * 11,
-      description,
-      8,
-      lineIndex === 0,
-      '#1F2937',
-    ),
-  );
-});
+if (t.showItemDescription || t.showItemCode) {
+  descriptionLines.forEach((description, lineIndex) => {
+    page.commands.push(
+      text(
+        LEFT,
+        page.y - lineIndex * 11,
+        description,
+        8,
+        lineIndex === 0,
+        '#1F2937',
+      ),
+    );
+  });
+}
 
-page.commands.push(
-  text(267, page.y, numberText(item.quantity), 8, false, '#1F2937', 'right'),
-);
-page.commands.push(
-  text(306, page.y, item.unit ?? '-', 8, false, '#1F2937'),
-);
-page.commands.push(
-  text(379, page.y, money(item.rate), 8, false, '#1F2937', 'right'),
-);
-page.commands.push(
-  text(447, page.y, money(item.itemDiscount), 8, false, '#1F2937', 'right'),
-);
-page.commands.push(
-  text(RIGHT, page.y, money(item.amount), 8, true, '#1F2937', 'right'),
-);
+if (t.showQuantity) {
+  page.commands.push(text(267, page.y, numberText(item.quantity), 8, false, '#1F2937', 'right'));
+  page.commands.push(text(306, page.y, item.unit ?? '-', 8, false, '#1F2937'));
+}
+if (t.showUnitPrice) {
+  page.commands.push(text(379, page.y, money(item.rate), 8, false, '#1F2937', 'right'));
+}
+if (t.showDiscount && item.itemDiscount) {
+  page.commands.push(text(447, page.y, money(item.itemDiscount), 8, false, '#1F2937', 'right'));
+}
+if (t.showItemTotal) {
+  page.commands.push(text(RIGHT, page.y, money(item.amount), 8, true, '#1F2937', 'right'));
+}
 
 // Put the divider clearly below the complete item row.
 const dividerY = page.y - rowHeight - 2;
@@ -125,35 +164,56 @@ page.y = dividerY - 10;
   });
 
   ensureSpace(150);
-  divider();
+  if (t.showSeparators) divider();
   section('Totals');
-  totalRow(page, 'Subtotal', money(receipt.financials.subtotal));
+  if (t.showSubtotal) totalRow(page, 'Subtotal', money(receipt.financials.subtotal));
   totalRow(page, 'Freight', money(receipt.financials.freight));
-  totalRow(page, 'Transaction Discount', money(receipt.financials.discountAmount));
-  totalRow(page, `VAT${receipt.financials.vatRate === undefined ? '' : ` (${numberText(receipt.financials.vatRate)}%)`}`, money(receipt.financials.vatAmount));
-  totalRow(page, 'Rounding', money(receipt.financials.rounding));
-  page.commands.push(rect(330, page.y - 7, RIGHT - 330, 25, '#EDEBFF'));
-  page.commands.push(text(342, page.y + 1, 'GRAND TOTAL', 10, true, '#4F46E5'));
-  page.commands.push(text(RIGHT - 10, page.y + 1, money(receipt.financials.total), 12, true, '#312E81', 'right'));
-  page.y -= 34;
+  if (t.showTotalDiscount) totalRow(page, 'Transaction Discount', money(receipt.financials.discountAmount));
+  if (t.showVatTotal) {
+    const taxLabel = p.receiptDefaults.defaultTaxLabel || 'VAT';
+    totalRow(page, `${taxLabel}${receipt.financials.vatRate === undefined ? '' : ` (${numberText(receipt.financials.vatRate)}%)`}`, money(receipt.financials.vatAmount));
+  }
+  if (t.showRoundOff) totalRow(page, 'Rounding', money(receipt.financials.rounding));
+  
+  if (t.showGrandTotal) {
+    page.commands.push(rect(330, page.y - 7, RIGHT - 330, 25, '#EDEBFF'));
+    page.commands.push(text(342, page.y + 1, 'GRAND TOTAL', 10, true, '#4F46E5'));
+    const curr = p.receiptDefaults.currencySymbol;
+    const pos = p.receiptDefaults.currencyPosition;
+    const formattedTotal = money(receipt.financials.total);
+    const totalWithCurrency = pos === 'before' ? `${curr} ${formattedTotal}` : `${formattedTotal} ${curr}`;
+    page.commands.push(text(RIGHT - 10, page.y + 1, totalWithCurrency, 12, true, '#312E81', 'right'));
+    page.y -= 34;
+  }
 
   pages.forEach((currentPage, index) => {
     currentPage.commands.push(line(LEFT, 52, RIGHT, 52, '#D7DBE5'));
-    currentPage.commands.push(text(LEFT, FOOTER_Y, 'Generated locally by Winsoft Print Station', 8, false, '#64748B'));
+    const footerMsg = t.showFooter && p.footer.footerMessage ? p.footer.footerMessage : 'Generated locally by Winsoft Print Station';
+    currentPage.commands.push(text(LEFT, FOOTER_Y, footerMsg, 8, false, '#64748B'));
     currentPage.commands.push(text(RIGHT, FOOTER_Y, `Page ${index + 1} of ${pages.length}`, 8, false, '#64748B', 'right'));
   });
 
   return assemblePdf(pages.map(currentPage => currentPage.commands.join('\n')));
 }
 
-function tableHeader(page: Page) {
+function tableHeader(page: Page, t: A4Template) {
   page.commands.push(rect(LEFT, page.y - 5, RIGHT - LEFT, 19, '#EDEBFF'));
-  page.commands.push(text(LEFT + 4, page.y, 'DESCRIPTION', 7, true, '#4F46E5'));
-  page.commands.push(text(267, page.y, 'QTY', 7, true, '#4F46E5', 'right'));
-  page.commands.push(text(306, page.y, 'UNIT', 7, true, '#4F46E5'));
-  page.commands.push(text(379, page.y, 'RATE', 7, true, '#4F46E5', 'right'));
-  page.commands.push(text(447, page.y, 'DISC.', 7, true, '#4F46E5', 'right'));
-  page.commands.push(text(RIGHT, page.y, 'AMOUNT', 7, true, '#4F46E5', 'right'));
+  if (t.showItemDescription || t.showItemCode) {
+    page.commands.push(text(LEFT + 4, page.y, 'DESCRIPTION', 7, true, '#4F46E5'));
+  }
+  if (t.showQuantity) {
+    page.commands.push(text(267, page.y, 'QTY', 7, true, '#4F46E5', 'right'));
+    page.commands.push(text(306, page.y, 'UNIT', 7, true, '#4F46E5'));
+  }
+  if (t.showUnitPrice) {
+    page.commands.push(text(379, page.y, 'RATE', 7, true, '#4F46E5', 'right'));
+  }
+  if (t.showDiscount) {
+    page.commands.push(text(447, page.y, 'DISC.', 7, true, '#4F46E5', 'right'));
+  }
+  if (t.showItemTotal) {
+    page.commands.push(text(RIGHT, page.y, 'AMOUNT', 7, true, '#4F46E5', 'right'));
+  }
 }
 
 function totalRow(page: Page, label: string, value: string) {
@@ -205,10 +265,13 @@ function text(
   size: number,
   bold: boolean,
   color: string,
-  align: 'left' | 'right' = 'left',
+  align: 'left' | 'right' | 'center' = 'left',
 ): string {
   const safeValue = pdfText(value);
-  const adjustedX = align === 'right' ? x - estimateWidth(safeValue, size, bold) : x;
+  const width = estimateWidth(safeValue, size, bold);
+  let adjustedX = x;
+  if (align === 'right') adjustedX = x - width;
+  if (align === 'center') adjustedX = x - width / 2;
   return `BT /${bold ? 'F2' : 'F1'} ${size} Tf ${colorCommand(color)} 1 0 0 1 ${adjustedX.toFixed(2)} ${y.toFixed(2)} Tm (${safeValue}) Tj ET`;
 }
 

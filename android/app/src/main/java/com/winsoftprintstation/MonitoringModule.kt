@@ -94,6 +94,37 @@ class MonitoringModule(private val reactContext: ReactApplicationContext) :
             }
     }
 
+    /**
+     * Copy text to the Android system clipboard.
+     */
+    @ReactMethod
+    fun copyToClipboard(text: String, promise: Promise) {
+        try {
+            val clipboard = reactContext.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val clip = android.content.ClipData.newPlainText("WinPrint", text)
+            clipboard.setPrimaryClip(clip)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("CLIPBOARD_ERROR", e.message ?: "Failed to copy text", e)
+        }
+    }
+
+    /**
+     * Return a stable Android device identifier.
+     */
+    @ReactMethod
+    fun getDeviceId(promise: Promise) {
+        try {
+            val id = android.provider.Settings.Secure.getString(
+                reactContext.contentResolver,
+                android.provider.Settings.Secure.ANDROID_ID
+            ) ?: "unknown_device"
+            promise.resolve(id)
+        } catch (e: Exception) {
+            promise.resolve("unknown_device")
+        }
+    }
+
     // ── Notification permission ───────────────────────────────────────────────
 
     @ReactMethod
@@ -218,8 +249,43 @@ class MonitoringModule(private val reactContext: ReactApplicationContext) :
     // ── Deferred files (LATER actions persisted by NotificationActionReceiver) ─
 
     /**
+     * Read deferred file entries without clearing them from SharedPreferences.
+     * Returns an array of "fileId::folderId" or "fileId::folderId::fileName" strings.
+     */
+    @ReactMethod
+    fun getDeferredFiles(promise: Promise) {
+        val prefs = reactContext.getSharedPreferences(WinsoftFcmService.PREFS_NAME, Context.MODE_PRIVATE)
+        val entries = prefs.getStringSet("deferred_files", emptySet()) ?: emptySet()
+        val arr = Arguments.createArray().apply {
+            entries.forEach { pushString(it) }
+        }
+        promise.resolve(arr)
+    }
+
+    /**
+     * Selectively clear transferred deferred files from SharedPreferences once React Native
+     * has safely persisted them into app state.
+     */
+    @ReactMethod
+    fun clearDeferredFiles(entries: com.facebook.react.bridge.ReadableArray, promise: Promise) {
+        val prefs = reactContext.getSharedPreferences(WinsoftFcmService.PREFS_NAME, Context.MODE_PRIVATE)
+        val existing = prefs.getStringSet("deferred_files", mutableSetOf()) ?: mutableSetOf()
+        val updated = existing.toMutableSet()
+        for (i in 0 until entries.size()) {
+            val entry = entries.getString(i) ?: continue
+            updated.remove(entry)
+            val fileId = entry.split("::").firstOrNull()
+            if (!fileId.isNullOrBlank()) {
+                updated.removeAll { it.split("::").firstOrNull() == fileId }
+            }
+        }
+        prefs.edit().putStringSet("deferred_files", updated).apply()
+        promise.resolve(true)
+    }
+
+    /**
      * Read and clear the deferred file IDs stored by NotificationActionReceiver.
-     * Returns an array of "fileId::folderId" strings.
+     * Maintained for backwards compatibility.
      */
     @ReactMethod
     fun consumeDeferredFiles(promise: Promise) {

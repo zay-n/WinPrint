@@ -1,18 +1,109 @@
-rules_version='2'
-
+rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    
+    // ── Default deny ────────────────────────────────────────────────────────────
+    // All access is explicitly denied unless a rule below permits it.
     match /{document=**} {
-      // This rule allows anyone with your database reference to view, edit,
-      // and delete all data in your database. It is useful for getting
-      // started, but it is configured to expire after 30 days because it
-      // leaves your app open to attackers. At that time, all client
-      // requests to your database will be denied.
-      //
-      // Make sure to write security rules for your app before that time, or
-      // else all client requests to your database will be denied until you
-      // update your rules.
-      allow read, write: if request.time < timestamp.date(2026, 10, 22);
+      allow read, write: if false;
+    }
+    
+    // ── Helper functions ────────────────────────────────────────────────────────
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    function isSelf(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isActiveUser() {
+      return isAuthenticated() &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'active';
+    }
+    
+    // ── Users collection ────────────────────────────────────────────────────────
+    match /users/{userId} {
+      // Users can read their own profile, admins can read all
+      allow read: if isSelf(userId) || isAdmin();
+      
+      // Users can create their own profile on first sign in.
+      // They may only set safe default fields — role must be 'user', status must be 'pending'.
+      // businessId injection is blocked (not allowed in create).
+      allow create: if isSelf(userId)
+                    && request.resource.data.keys().hasOnly(['email', 'displayName', 'status', 'role', 'createdAt'])
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.role == 'user';
+                    
+      // Only admins can update users.
+      // Self-protection: an admin cannot change their own role or status.
+      allow update: if isAdmin()
+                    && (
+                      // Updating someone else — no restrictions on fields
+                      !isSelf(userId)
+                      ||
+                      // Updating self — must not change role or status
+                      (
+                        request.resource.data.role == resource.data.role &&
+                        request.resource.data.status == resource.data.status
+                      )
+                    );
+      
+      // Only admins can delete user records
+      allow delete: if isAdmin() && !isSelf(userId);
+    }
+    
+    // ── Customers collection ────────────────────────────────────────────────────
+    match /customers/{businessId} {
+      // Admins can read all.
+      // Active users can read their own assigned customer if they are in allowedUserIds and the business is active.
+      allow read: if isAdmin() || (
+        isActiveUser() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.businessId == businessId &&
+        resource.data.allowedUserIds[request.auth.uid] == true &&
+        resource.data.status == 'active'
+      );
+      
+      // Only admins can create, update, or delete customers.
+      // Normal users cannot add themselves to a business.
+      allow create, update, delete: if isAdmin();
+    }
+    
+    // ── Devices collection ──────────────────────────────────────────────────────
+    // Each document ID is the user's Firebase UID.
+    match /devices/{uid} {
+      // Admins can read all device records.
+      // Users can read and write their own device record (for FCM registration).
+      allow read: if isAdmin() || isSelf(uid);
+      
+      // Users may create/update their own device record.
+      // They cannot mark themselves as disabled — that is admin-only.
+      allow create: if isSelf(uid)
+                    && (!('disabled' in request.resource.data) || request.resource.data.disabled == false);
+      
+      allow update: if (isSelf(uid) && !request.resource.data.get('disabled', false))
+                    || isAdmin();
+      
+      // Only admins can delete device records.
+      allow delete: if isAdmin();
+    }
+    
+    // ── Audit Log collection ────────────────────────────────────────────────────
+    // Entries are written by admins (and potentially Cloud Functions).
+    // Normal users cannot write or read audit entries.
+    // This enforces integrity so users cannot forge audit entries.
+    match /auditLog/{entryId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+                    && request.resource.data.actorUid == request.auth.uid
+                    && request.resource.data.timestamp == request.time;
+      allow update, delete: if false;
     }
   }
 }

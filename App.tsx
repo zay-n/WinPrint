@@ -12,6 +12,7 @@ import {SafeAreaProvider} from 'react-native-safe-area-context';
 import {enableScreens} from 'react-native-screens';
 
 import AppNavigator from './src/navigation/AppNavigator';
+import AuthGate from './src/components/AuthGate';
 import {useAppStore} from './src/store/useAppStore';
 import * as MonitoringService from './src/services/monitoring/MonitoringService';
 import {BACKEND_BASE_URL} from './src/config/backend';
@@ -21,6 +22,7 @@ enableScreens();
 
 export default function App() {
   const restoreSession = useAppStore(state => state.restoreSession);
+  const validateSavedFolders = useAppStore(state => state.validateSavedFolders);
 
   useEffect(() => {
     const boot = async () => {
@@ -28,34 +30,47 @@ export default function App() {
       // are available in the store before MonitoringService reads them.
       await restoreSession();
 
-      // Wire the Zustand store into MonitoringService.
-      // getState() is called lazily inside each accessor so the service always
-      // reads the current (post-restore) values rather than the stale closure.
-      const store = useAppStore.getState;
+      // Validate saved Drive folders in the background if signed in
+      const currentToken = useAppStore.getState().accessToken;
+      if (currentToken) {
+        void validateSavedFolders();
+      }
+
+      // Initialize MonitoringService so event listeners are active
       await MonitoringService.initialize(
         {
-          getAccessToken: () => store().accessToken,
-          getSourceFolderId: () => store().sourceFolderId,
-          getFcmRegistrationStatus: () => store().fcmRegistrationStatus,
-          getCachedFcmToken: () => store().fcmToken,
-          enqueueReceipt: r => store().enqueueReceipt(r),
-          processQueue: () => store().processQueue(),
-          setFcmToken: t => store().setFcmToken(t),
-          setFcmRegistrationStatus: s => store().setFcmRegistrationStatus(s),
-          setServiceAccountEmail: e => store().setServiceAccountEmail(e),
-          recordDriveNotification: () => store().recordDriveNotification(),
-          recordReconciliation: () => store().recordReconciliation(),
-          setMonitoringError: msg => store().setMonitoringError(msg),
-          addDeferredFileId: entry => store().addDeferredFileId(entry),
-          removeDeferredFileId: entry => store().removeDeferredFileId(entry),
-          getDeferredFileIds: () => store().deferredFileIds,
+          getAccessToken: () => useAppStore.getState().accessToken,
+          getSourceFolderId: () => useAppStore.getState().sourceFolderId,
+          getSourceFolderName: () => useAppStore.getState().sourceFolderName,
+          getFcmRegistrationStatus: () => useAppStore.getState().fcmRegistrationStatus,
+          getCachedFcmToken: () => useAppStore.getState().fcmToken,
+          getUserId: () => useAppStore.getState().authProfile?.uid ?? useAppStore.getState().user?.id ?? null,
+          getUserEmail: () => useAppStore.getState().user?.email ?? useAppStore.getState().authProfile?.email ?? null,
+          getBusinessId: () => useAppStore.getState().authProfile?.businessId ?? null,
+          enqueueReceipt: r => useAppStore.getState().enqueueReceipt(r),
+          processQueue: () => useAppStore.getState().processQueue(),
+          setFcmToken: t => useAppStore.getState().setFcmToken(t),
+          setFcmRegistrationStatus: s => useAppStore.getState().setFcmRegistrationStatus(s),
+          setServiceAccountEmail: e => useAppStore.getState().setServiceAccountEmail(e),
+          recordDriveNotification: () => useAppStore.getState().recordDriveNotification(),
+          recordReconciliation: () => useAppStore.getState().recordReconciliation(),
+          setMonitoringError: msg => useAppStore.getState().setMonitoringError(msg),
+          addDeferredFileId: entry => useAppStore.getState().addDeferredFileId(entry),
+          removeDeferredFileId: entry => useAppStore.getState().removeDeferredFileId(entry),
+          getDeferredFileIds: () => useAppStore.getState().deferredFileIds,
         },
         BACKEND_BASE_URL,
       );
+
+      // If user is already authenticated with an incoming folder, automatically register
+      const currentStore = useAppStore.getState();
+      if (currentStore.user && currentStore.sourceFolderId) {
+        void MonitoringService.ensureRegistered();
+      }
     };
 
     void boot();
-  }, [restoreSession]);
+  }, [restoreSession, validateSavedFolders]);
 
   return (
     <SafeAreaProvider>
@@ -67,7 +82,9 @@ export default function App() {
        */}
       <StatusBar barStyle="light-content" />
       <NavigationContainer>
-        <AppNavigator />
+        <AuthGate>
+          <AppNavigator />
+        </AuthGate>
       </NavigationContainer>
     </SafeAreaProvider>
   );

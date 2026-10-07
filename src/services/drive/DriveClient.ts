@@ -22,6 +22,7 @@ export interface DriveFile {
   modifiedTime?: string;
   size?: string;
   parents?: string[];
+  trashed?: boolean;
 }
 
 export interface DriveFileList {
@@ -182,7 +183,7 @@ export async function getFileMetadata(
   fileId: string,
 ): Promise<DriveFile> {
   const params = new URLSearchParams({
-    fields: 'id,name,mimeType,modifiedTime,size,parents',
+    fields: 'id,name,mimeType,modifiedTime,size,parents,trashed',
   });
   return driveRequest<DriveFile>(
     `${DRIVE_API_BASE}/files/${fileId}?${params.toString()}`,

@@ -11,6 +11,7 @@
  */
 
 import type {Receipt} from '../../models/Receipt';
+import type {BusinessProfile, A4Template, ThermalTemplate} from '../../models/Profile';
 
 export type PrinterType = 'office' | 'thermal';
 
@@ -48,7 +49,7 @@ export interface PrinterAdapter {
   disconnect?(): Promise<void>;
 
   /** Prints a normalized Receipt object. */
-  print(receipt: Receipt): Promise<PrintResult>;
+  print(receipt: Receipt, profile?: BusinessProfile, template?: A4Template | ThermalTemplate): Promise<PrintResult>;
 
   /** Sends a self-test page or receipt to verify physical printing. */
   testPrint(): Promise<PrintResult>;

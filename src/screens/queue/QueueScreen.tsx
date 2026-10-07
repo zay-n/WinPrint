@@ -13,21 +13,38 @@ export default function QueueScreen() {
   const printLoading = useAppStore(s => s.printLoading);
   const selectedPrinterType = useAppStore(s => s.selectedPrinterType);
 
+  // Deferred bills state
+  const deferredFileIds = useAppStore(s => s.deferredFileIds);
+  const deferredLoadingId = useAppStore(s => s.deferredLoadingId);
+  const deferredError = useAppStore(s => s.deferredError);
+  const clearDeferredError = useAppStore(s => s.clearDeferredError);
+  const enqueueDeferredFile = useAppStore(s => s.enqueueDeferredFile);
+  const enqueueAllDeferredFiles = useAppStore(s => s.enqueueAllDeferredFiles);
+
   const activeQueue = queue.filter(q => q.status !== 'PRINTED');
   const failedCount = activeQueue.filter(q => q.status === 'FAILED').length;
   const queuedCount = activeQueue.filter(q => q.status === 'QUEUED').length;
+  const deferredCount = deferredFileIds.length;
 
   return (
     <SafeAreaView style={styles.safe} edges={['bottom']}>
       <View style={styles.headerArea}>
         <View style={styles.statsRow}>
           <View style={styles.statBox}>
-            <Text style={styles.statLabel}>Queued</Text>
+            <Text style={styles.statLabel}>Waiting</Text>
             <Text style={styles.statValue}>{queuedCount}</Text>
           </View>
           <View style={styles.statBox}>
+            <Text style={styles.statLabel}>Pending Action</Text>
+            <Text style={[styles.statValue, deferredCount > 0 && { color: Colors.warning }]}>
+              {deferredCount}
+            </Text>
+          </View>
+          <View style={styles.statBox}>
             <Text style={styles.statLabel}>Failed</Text>
-            <Text style={[styles.statValue, failedCount > 0 && { color: Colors.error }]}>{failedCount}</Text>
+            <Text style={[styles.statValue, failedCount > 0 && { color: Colors.error }]}>
+              {failedCount}
+            </Text>
           </View>
         </View>
 
@@ -65,13 +82,103 @@ export default function QueueScreen() {
         data={activeQueue.slice().reverse()}
         keyExtractor={item => item.identity}
         contentContainerStyle={styles.listContent}
+        ListHeaderComponent={
+          deferredCount > 0 ? (
+            <View style={styles.deferredSection}>
+              <View style={styles.deferredSectionHeader}>
+                <View style={styles.deferredHeaderTitleRow}>
+                  <Icon name="clock-outline" size={18} color={Colors.warning} />
+                  <Text style={styles.deferredSectionTitle}>
+                    Bills Waiting for Action ({deferredCount})
+                  </Text>
+                </View>
+                {deferredCount > 1 && (
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.enqueueAllBtn,
+                      Boolean(deferredLoadingId) && styles.actionBtnDisabled,
+                      pressed && styles.actionBtnPressed,
+                    ]}
+                    disabled={Boolean(deferredLoadingId)}
+                    onPress={enqueueAllDeferredFiles}>
+                    <Text style={styles.enqueueAllBtnText}>Enqueue All</Text>
+                  </Pressable>
+                )}
+              </View>
+
+              {deferredError ? (
+                <View style={styles.deferredErrorBanner}>
+                  <Icon name="alert-circle" size={16} color={Colors.error} />
+                  <Text style={styles.deferredErrorText}>{deferredError}</Text>
+                  <Pressable onPress={clearDeferredError} hitSlop={8}>
+                    <Icon name="close" size={16} color={Colors.error} />
+                  </Pressable>
+                </View>
+              ) : null}
+
+              {deferredFileIds.map(entry => {
+                const parts = entry.split('::');
+                const fileId = parts[0];
+                const fileName = parts[2];
+                const isEnqueuing = deferredLoadingId === entry;
+
+                return (
+                  <View key={entry} style={styles.deferredCard}>
+                    <View style={styles.deferredCardContent}>
+                      <View style={styles.deferredCardHeader}>
+                        <Text style={styles.deferredCardTitle} numberOfLines={1}>
+                          {fileName || 'Winsoft Bill CSV'}
+                        </Text>
+                        <View style={styles.deferredBadge}>
+                          <Text style={styles.deferredBadgeText}>WAITING</Text>
+                        </View>
+                      </View>
+                      <Text style={styles.deferredCardSubtitle} numberOfLines={1}>
+                        Saved for later — tap Enqueue to print
+                      </Text>
+                    </View>
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.enqueueBtn,
+                        isEnqueuing && styles.actionBtnDisabled,
+                        pressed && styles.actionBtnPressed,
+                      ]}
+                      disabled={Boolean(deferredLoadingId)}
+                      onPress={() => void enqueueDeferredFile(entry)}>
+                      {isEnqueuing ? (
+                        <ActivityIndicator size="small" color="#fff" />
+                      ) : (
+                        <Icon name="tray-arrow-down" size={16} color="#fff" />
+                      )}
+                      <Text style={styles.enqueueBtnText}>
+                        {isEnqueuing ? 'Enqueuing...' : 'Enqueue'}
+                      </Text>
+                    </Pressable>
+                  </View>
+                );
+              })}
+
+              {activeQueue.length > 0 && (
+                <View style={styles.activeQueueSubheader}>
+                  <Text style={styles.activeQueueSubheaderText}>
+                    Active Print Queue ({activeQueue.length})
+                  </Text>
+                </View>
+              )}
+            </View>
+          ) : undefined
+        }
         renderItem={({ item }) => <QueueItemRow item={item} />}
         ListEmptyComponent={
           <View style={styles.emptyState}>
             <Icon name="inbox-outline" size={48} color={Colors.inactive} />
-            <Text style={styles.emptyTitle}>Queue is empty</Text>
+            <Text style={styles.emptyTitle}>
+              {deferredCount > 0 ? 'No active items in queue' : 'Queue is empty'}
+            </Text>
             <Text style={styles.emptyDesc}>
-              Parse a CSV and enqueue transactions to print.
+              {deferredCount > 0
+                ? 'Tap "Enqueue" on a deferred bill above to prepare it for printing.'
+                : 'Parse a CSV and enqueue transactions to print.'}
             </Text>
           </View>
         }
@@ -83,6 +190,8 @@ export default function QueueScreen() {
 function QueueItemRow({ item }: { item: QueueItem }) {
   const isFailed = item.status === 'FAILED';
   const isPrinting = item.status === 'PRINTING';
+  const statusLabel = isFailed ? 'Print failed' : isPrinting ? 'Printing...' : 'Waiting to print';
+  const statusColor = isFailed ? Colors.error : isPrinting ? Colors.active : Colors.textSecondary;
 
   return (
     <View style={[styles.itemCard, isFailed && styles.itemCardFailed, isPrinting && styles.itemCardPrinting]}>
@@ -97,8 +206,8 @@ function QueueItemRow({ item }: { item: QueueItem }) {
             {item.receipt.transactionType} {item.receipt.transactionNumber}
           </Text>
         </View>
-        <Text style={[styles.itemStatus, isFailed && styles.itemStatusFailed, isPrinting && styles.itemStatusPrinting]}>
-          {item.status}
+        <Text style={[styles.itemStatus, {color: statusColor}]}>
+          {statusLabel}
         </Text>
       </View>
       <Text style={styles.itemDetails}>
@@ -270,5 +379,125 @@ const styles = StyleSheet.create({
     color: Colors.textTertiary,
     fontSize: 10,
     marginTop: Spacing.xs,
+  },
+  deferredSection: {
+    marginBottom: Spacing.base,
+    gap: Spacing.sm,
+  },
+  deferredSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: Spacing.xs,
+  },
+  deferredHeaderTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs,
+  },
+  deferredSectionTitle: {
+    ...Typography.bodyMedium,
+    color: Colors.warning,
+    fontWeight: '700',
+  },
+  enqueueAllBtn: {
+    backgroundColor: Colors.warningDim,
+    borderWidth: 1,
+    borderColor: `${Colors.warning}66`,
+    paddingVertical: Spacing.xs,
+    paddingHorizontal: Spacing.sm,
+    borderRadius: BorderRadius.sm,
+  },
+  enqueueAllBtnText: {
+    ...Typography.captionMedium,
+    color: Colors.warning,
+    fontWeight: '600',
+  },
+  deferredErrorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs,
+    backgroundColor: Colors.errorDim,
+    borderWidth: 1,
+    borderColor: `${Colors.error}55`,
+    borderRadius: BorderRadius.sm,
+    padding: Spacing.sm,
+  },
+  deferredErrorText: {
+    ...Typography.caption,
+    color: Colors.error,
+    flex: 1,
+  },
+  deferredCard: {
+    backgroundColor: Colors.card,
+    borderRadius: BorderRadius.md,
+    borderWidth: 1,
+    borderColor: `${Colors.warning}44`,
+    padding: Spacing.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.sm,
+    ...Shadow.sm,
+  },
+  deferredCardContent: {
+    flex: 1,
+    gap: 2,
+  },
+  deferredCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs,
+  },
+  deferredCardTitle: {
+    ...Typography.bodyMedium,
+    color: Colors.textPrimary,
+    fontWeight: '600',
+    flex: 1,
+  },
+  deferredBadge: {
+    backgroundColor: Colors.warningDim,
+    borderWidth: 1,
+    borderColor: `${Colors.warning}66`,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: BorderRadius.xs,
+  },
+  deferredBadgeText: {
+    ...Typography.caption,
+    color: Colors.warning,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  deferredCardSubtitle: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
+    fontSize: 11,
+  },
+  enqueueBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: Colors.primary,
+    paddingVertical: Spacing.sm,
+    paddingHorizontal: Spacing.md,
+    borderRadius: BorderRadius.sm,
+  },
+  enqueueBtnText: {
+    ...Typography.captionMedium,
+    color: '#fff',
+    fontWeight: '600',
+  },
+  activeQueueSubheader: {
+    paddingTop: Spacing.sm,
+    paddingBottom: Spacing.xs,
+    borderTopWidth: 1,
+    borderTopColor: Colors.border,
+    marginTop: Spacing.xs,
+  },
+  activeQueueSubheaderText: {
+    ...Typography.captionMedium,
+    color: Colors.textSecondary,
+    textTransform: 'uppercase',
   },
 });

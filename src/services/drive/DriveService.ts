@@ -32,6 +32,13 @@ export async function listCsvFiles(
   return DriveClient.listCsvFiles(accessToken, folderId);
 }
 
+export async function getFileMetadata(
+  accessToken: string,
+  fileId: string,
+): Promise<DriveFile> {
+  return DriveClient.getFileMetadata(accessToken, fileId);
+}
+
 export async function downloadAndParseCsv(
   accessToken: string,
   file: DriveFile,

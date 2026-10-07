@@ -22,7 +22,8 @@ module.exports = {
       '@react-native|' +
       'react-native|' +
       '@react-native-google-signin/google-signin|' +
-      '@react-native-async-storage/async-storage' +
+      '@react-native-async-storage/async-storage|' +
+      '@react-native-firebase' +
       ')/)',
   ],
 };

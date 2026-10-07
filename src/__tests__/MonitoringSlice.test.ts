@@ -14,7 +14,7 @@
  *  - Replacing the whole module breaks TurboModuleRegistry in tests.
  */
 
-import { NativeModules } from 'react-native';
+import { NativeModules, Platform } from 'react-native';
 import { useAppStore } from '../store/useAppStore';
 import type { FcmRegistrationStatus } from '../store/useAppStore';
 import type { Receipt } from '../models/Receipt';
@@ -28,6 +28,8 @@ const mockGetNotificationPermissionStatus = jest.fn().mockResolvedValue('granted
 const mockRequestNotificationPermission = jest.fn().mockResolvedValue('granted');
 const mockScheduleReconciliation = jest.fn().mockResolvedValue(true);
 const mockGetInitialPrintIntent = jest.fn().mockResolvedValue(null);
+const mockGetDeferredFiles = jest.fn().mockResolvedValue([]);
+const mockClearDeferredFiles = jest.fn().mockResolvedValue(true);
 const mockConsumeDeferredFiles = jest.fn().mockResolvedValue([]);
 
 // Inject before any require of MonitoringService
@@ -38,7 +40,11 @@ const mockConsumeDeferredFiles = jest.fn().mockResolvedValue([]);
   scheduleReconciliation: mockScheduleReconciliation,
   cancelReconciliation: jest.fn().mockResolvedValue(true),
   getInitialPrintIntent: mockGetInitialPrintIntent,
+  getDeferredFiles: mockGetDeferredFiles,
+  clearDeferredFiles: mockClearDeferredFiles,
   consumeDeferredFiles: mockConsumeDeferredFiles,
+  copyToClipboard: jest.fn().mockResolvedValue(true),
+  getDeviceId: jest.fn().mockResolvedValue('test-device-id'),
   addListener: jest.fn(),
   removeListeners: jest.fn(),
 };
@@ -49,10 +55,12 @@ const mockConsumeDeferredFiles = jest.fn().mockResolvedValue([]);
 
 const mockListCsvFiles = jest.fn();
 const mockDownloadAndParseCsv = jest.fn();
+const mockGetFileMetadata = jest.fn();
 
 jest.mock('../services/drive/DriveService', () => ({
   listCsvFiles: (...args: unknown[]) => mockListCsvFiles(...args),
   downloadAndParseCsv: (...args: unknown[]) => mockDownloadAndParseCsv(...args),
+  getFileMetadata: (...args: unknown[]) => mockGetFileMetadata(...args),
   moveFile: jest.fn(),
   listFolders: jest.fn(),
 }));
@@ -124,10 +132,14 @@ beforeEach(() => {
     lastReconciliationAt: null,
     lastMonitoringError: null,
     deferredFileIds: [],
+    deferredLoadingId: null,
+    deferredError: null,
   });
 
   jest.clearAllMocks();
   mockGetInitialPrintIntent.mockResolvedValue(null);
+  mockGetDeferredFiles.mockResolvedValue([]);
+  mockClearDeferredFiles.mockResolvedValue(true);
   mockConsumeDeferredFiles.mockResolvedValue([]);
   MonitoringService.destroy();
 
@@ -546,3 +558,271 @@ describe('MonitoringService — ensureRegistered()', () => {
     expect(addListenerCallCount2).toBe(addListenerCallCount1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Group 4: LATER / Deferred Receipt Flow
+// ---------------------------------------------------------------------------
+
+describe('MonitoringSlice — LATER / Deferred Receipts', () => {
+  const backendUrl = 'https://backend.example.com';
+
+  function mockSuccessBackend() {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      text: jest.fn().mockResolvedValue(JSON.stringify({
+        ok: true,
+        serviceAccountEmail: 'sa@test.iam.gserviceaccount.com',
+      })),
+    } as unknown as Response);
+  }
+
+  test('21. addDeferredFileId upgrades entry with rich fileName and deduplicates by fileId', () => {
+    const store = useAppStore.getState();
+    store.addDeferredFileId('file-100::folder-1');
+    expect(useAppStore.getState().deferredFileIds).toEqual(['file-100::folder-1']);
+
+    // Duplicate fileId with fileName upgrades the entry
+    store.addDeferredFileId('file-100::folder-1::Invoice.csv');
+    expect(useAppStore.getState().deferredFileIds).toEqual(['file-100::folder-1::Invoice.csv']);
+
+    // Duplicate without fileName does not downgrade
+    store.addDeferredFileId('file-100::folder-1');
+    expect(useAppStore.getState().deferredFileIds).toEqual(['file-100::folder-1::Invoice.csv']);
+  });
+
+  test('22. removeDeferredFileId matches by fileId prefix', () => {
+    const store = useAppStore.getState();
+    store.addDeferredFileId('file-200::folder-1::Receipt.csv');
+    store.removeDeferredFileId('file-200::folder-1');
+    expect(useAppStore.getState().deferredFileIds).toHaveLength(0);
+  });
+
+  test('23. Native clearDeferredFiles acknowledgement on initialize()', async () => {
+    const origPlatform = Platform.OS;
+    (Platform as { OS: string }).OS = 'android';
+    try {
+      mockSuccessBackend();
+      mockGetDeferredFiles.mockResolvedValue(['file-init::folder-1::init.csv']);
+
+      const accessor = buildStoreAccessor();
+      await MonitoringService.initialize(accessor, backendUrl);
+
+      expect(useAppStore.getState().deferredFileIds).toContain('file-init::folder-1::init.csv');
+      expect(mockClearDeferredFiles).toHaveBeenCalledWith(['file-init::folder-1::init.csv']);
+    } finally {
+      (Platform as { OS: string }).OS = origPlatform;
+    }
+  });
+
+  test('24. Native clearDeferredFiles acknowledgement on LATER action', async () => {
+    mockSuccessBackend();
+    const accessor = buildStoreAccessor();
+    await MonitoringService.initialize(accessor, backendUrl);
+
+    MonitoringService.onLaterActionReceived({
+      fileId: 'file-evt',
+      folderId: 'folder-1',
+      fileName: 'bill.csv',
+    });
+
+    expect(useAppStore.getState().deferredFileIds).toContain('file-evt::folder-1::bill.csv');
+    expect(mockClearDeferredFiles).toHaveBeenCalledWith([
+      'file-evt::folder-1::bill.csv',
+      'file-evt::folder-1',
+    ]);
+  });
+
+  test('25. enqueueDeferredFile: success with multiple receipts and no processQueue() call', async () => {
+    const r1 = makeReceipt('010', 'file-multi');
+    const r2 = makeReceipt('011', 'file-multi');
+    mockGetFileMetadata.mockResolvedValue({
+      id: 'file-multi',
+      name: 'multi.csv',
+      mimeType: 'text/csv',
+    });
+    mockDownloadAndParseCsv.mockResolvedValue(makeParsedCsv([r1, r2]));
+
+    useAppStore.setState({
+      accessToken: 'valid-token',
+      sourceFolderId: 'folder-123',
+      deferredFileIds: ['file-multi::folder-123::multi.csv'],
+    });
+
+    const store = useAppStore.getState();
+    const success = await store.enqueueDeferredFile('file-multi::folder-123::multi.csv');
+
+    expect(success).toBe(true);
+    expect(useAppStore.getState().deferredFileIds).toHaveLength(0);
+    const queue = useAppStore.getState().queue;
+    expect(queue).toHaveLength(2);
+    expect(queue[0].identity).toBe('file-multi::INV::010');
+    expect(queue[0].status).toBe('QUEUED');
+    expect(queue[1].identity).toBe('file-multi::INV::011');
+    expect(queue[1].status).toBe('QUEUED');
+
+    // Expected count in csvProgress tracked for auto-archive
+    expect(useAppStore.getState().csvProgress['file-multi']?.expectedCount).toBe(2);
+
+    // Verify processQueue was NOT called (no auto-printing)
+    expect(useAppStore.getState().printLoading).toBe(false);
+  });
+
+  test('26. Drive/download failure preserves deferred item and sets deferredError', async () => {
+    mockGetFileMetadata.mockRejectedValue(new Error('Network timeout'));
+    mockListCsvFiles.mockRejectedValue(new Error('Folder unreadable'));
+    mockDownloadAndParseCsv.mockRejectedValue(new Error('Download failed: 503'));
+
+    useAppStore.setState({
+      accessToken: 'valid-token',
+      sourceFolderId: 'folder-123',
+      deferredFileIds: ['file-err::folder-123::err.csv'],
+    });
+
+    const store = useAppStore.getState();
+    const success = await store.enqueueDeferredFile('file-err::folder-123::err.csv');
+
+    expect(success).toBe(false);
+    // Item is preserved!
+    expect(useAppStore.getState().deferredFileIds).toEqual(['file-err::folder-123::err.csv']);
+    expect(useAppStore.getState().deferredError).toMatch(/Download failed: 503/);
+    expect(useAppStore.getState().queue).toHaveLength(0);
+  });
+
+  test('27. Reconciliation ignores explicitly deferred file IDs', async () => {
+    const freshReceipt = makeReceipt('999', 'file-fresh');
+    mockListCsvFiles.mockResolvedValue([
+      { id: 'file-deferred', name: 'deferred.csv', mimeType: 'text/csv' },
+      { id: 'file-fresh', name: 'fresh.csv', mimeType: 'text/csv' },
+    ]);
+    mockDownloadAndParseCsv.mockResolvedValue(makeParsedCsv([freshReceipt]));
+    mockSuccessBackend();
+
+    useAppStore.setState({
+      accessToken: 'valid-token',
+      sourceFolderId: 'folder-123',
+      deferredFileIds: ['file-deferred::folder-123::deferred.csv'],
+    });
+
+    const accessor = buildStoreAccessor();
+    await MonitoringService.initialize(accessor, backendUrl);
+    await MonitoringService.runReconciliation();
+
+    // Only file-fresh was downloaded & enqueued
+    expect(mockDownloadAndParseCsv).toHaveBeenCalledTimes(1);
+    expect(mockDownloadAndParseCsv).toHaveBeenCalledWith(
+      'test-access-token',
+      expect.objectContaining({ id: 'file-fresh' }),
+    );
+
+    const queue = useAppStore.getState().queue;
+    expect(queue).toHaveLength(1);
+    expect(queue[0].identity).toBe('file-fresh::INV::999');
+
+    // file-deferred is STILL in deferredFileIds
+    expect(useAppStore.getState().deferredFileIds).toContain(
+      'file-deferred::folder-123::deferred.csv',
+    );
+  });
+
+  test('28. enqueueAllDeferredFiles enqueues all entries', async () => {
+    const r1 = makeReceipt('101', 'file-a');
+    const r2 = makeReceipt('102', 'file-b');
+    mockGetFileMetadata.mockImplementation((_tok, id) =>
+      Promise.resolve({ id, name: `${id}.csv`, mimeType: 'text/csv' }),
+    );
+    mockDownloadAndParseCsv.mockImplementation((_tok, file) => {
+      const receipt = file.id === 'file-a' ? r1 : r2;
+      return Promise.resolve(makeParsedCsv([receipt]));
+    });
+
+    useAppStore.setState({
+      accessToken: 'valid-token',
+      sourceFolderId: 'folder-123',
+      deferredFileIds: ['file-a::folder-123', 'file-b::folder-123'],
+    });
+
+    const store = useAppStore.getState();
+    await store.enqueueAllDeferredFiles();
+
+    expect(useAppStore.getState().deferredFileIds).toHaveLength(0);
+    expect(useAppStore.getState().queue).toHaveLength(2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Reconnect / Disconnect Lifecycle & Clipboard
+  // ---------------------------------------------------------------------------
+
+  test('29. reconnect() checks permission, refreshes token, calls backend with forceRefresh: true', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'application/json' },
+      text: jest.fn().mockResolvedValue(JSON.stringify({
+        status: 'ok',
+        channelId: 'new-chan-456',
+        serviceAccountEmail: 'sa@example.com',
+      })),
+    } as unknown as Response);
+
+    const accessor = buildStoreAccessor();
+    await MonitoringService.initialize(accessor, backendUrl);
+    useAppStore.setState({ sourceFolderId: 'folder-123' });
+    mockGetFcmToken.mockResolvedValue('fresh-fcm-token');
+
+    await MonitoringService.reconnect();
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://backend.example.com/registerdevice',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.stringContaining('"forceRefresh":true'),
+      }),
+    );
+    expect(useAppStore.getState().fcmRegistrationStatus).toBe('registered');
+    expect(useAppStore.getState().serviceAccountEmail).toBe('sa@example.com');
+  });
+
+  test('30. reconnect() throws if sourceFolderId is missing', async () => {
+    const accessor = {
+      ...buildStoreAccessor(),
+      getSourceFolderId: () => null as string | null,
+    };
+    await MonitoringService.initialize(accessor, backendUrl);
+
+    await expect(MonitoringService.reconnect()).rejects.toThrow(/Incoming Drive folder not configured/);
+    expect(useAppStore.getState().fcmRegistrationStatus).toBe('error');
+  });
+
+  test('31. reconnect() throws if notification permission is denied', async () => {
+    mockGetNotificationPermissionStatus.mockResolvedValueOnce('denied');
+    mockRequestNotificationPermission.mockResolvedValueOnce('denied');
+
+    const accessor = buildStoreAccessor();
+    await MonitoringService.initialize(accessor, backendUrl);
+    useAppStore.setState({ sourceFolderId: 'folder-123' });
+
+    await expect(MonitoringService.reconnect()).rejects.toThrow(/Notification permission is disabled/);
+    expect(useAppStore.getState().fcmRegistrationStatus).toBe('error');
+  });
+
+  test('32. disconnect() resets status to unregistered and clears error', () => {
+    const accessor = buildStoreAccessor();
+    void MonitoringService.initialize(accessor, backendUrl);
+    useAppStore.setState({
+      fcmRegistrationStatus: 'registered',
+      lastMonitoringError: 'some error',
+    });
+
+    MonitoringService.disconnect();
+
+    expect(useAppStore.getState().fcmRegistrationStatus).toBe('unregistered');
+    expect(useAppStore.getState().lastMonitoringError).toBeNull();
+  });
+
+  test('33. copyToClipboard() calls native module clipboard method', async () => {
+    const res = await MonitoringService.copyToClipboard('test-text');
+    expect(res).toBe(true);
+  });
+});
+

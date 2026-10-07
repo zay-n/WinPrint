@@ -7,14 +7,19 @@
 
 import RNFS from 'react-native-fs';
 import type {Receipt} from '../../models/Receipt';
+import type {BusinessProfile, A4Template} from '../../models/Profile';
 import {buildReceiptPdf} from './ReceiptPdfDocument';
 
 const RECEIPT_PDF_DIRECTORY = `${RNFS.DocumentDirectoryPath}/receipts`;
 
-export async function generateReceiptPdf(receipt: Receipt): Promise<string> {
+export async function generateReceiptPdf(
+  receipt: Receipt,
+  profile?: BusinessProfile,
+  template?: A4Template,
+): Promise<string> {
   const filename = receiptPdfFilename(receipt);
   const path = `${RECEIPT_PDF_DIRECTORY}/${filename}`;
-  const document = buildReceiptPdf(receipt);
+  const document = buildReceiptPdf(receipt, profile, template);
 
   try {
     await RNFS.mkdir(RECEIPT_PDF_DIRECTORY);

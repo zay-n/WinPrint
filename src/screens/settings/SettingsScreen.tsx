@@ -11,21 +11,10 @@
  *  - Printer
  *  - Monitoring
  *  - App
- */
-
-import React, {useCallback, useState} from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  Modal,
-  ScrollView,
-  StyleSheet,
-  Switch,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+ */import React, {useCallback, useState, useEffect} from 'react';
+import {View, Text, StyleSheet, ScrollView, TouchableOpacity, Switch, Modal, Alert, ActivityIndicator} from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
+import type {SettingsScreenProps} from '../../navigation/types';
 
 import Icon from '../../components/Icon';
 import SectionHeader from '../../components/SectionHeader';
@@ -34,10 +23,27 @@ import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
 import {useAppStore} from '../../store/useAppStore';
 import type {BluetoothDevice, PrinterType} from '../../services/printer/PrinterAdapter';
 import * as MonitoringService from '../../services/monitoring/MonitoringService';
+import DriveFolderPickerModal from '../../components/DriveFolderPickerModal';
+import {buildThermalReceipt} from '../../services/printer/escpos/EscPosReceiptBuilder';
+import {debugEscPos} from '../../services/printer/escpos/debugEscPos';
+import type {Receipt} from '../../models/Receipt';
 
-export default function SettingsScreen() {
+export default function SettingsScreen({navigation}: SettingsScreenProps) {
   const user = useAppStore(s => s.user);
+  const authProfile = useAppStore(s => s.authProfile);
+  const signOut = useAppStore(s => s.signOut);
+  const accessToken = useAppStore(s => s.accessToken);
+  const sourceFolderId = useAppStore(s => s.sourceFolderId);
   const sourceFolderName = useAppStore(s => s.sourceFolderName);
+  const sourceFolderPath = useAppStore(s => s.sourceFolderPath);
+  const archiveFolderId = useAppStore(s => s.archiveFolderId);
+  const archiveFolderName = useAppStore(s => s.archiveFolderName);
+  const archiveFolderPath = useAppStore(s => s.archiveFolderPath);
+  const selectFolder = useAppStore(s => s.selectFolder);
+  const selectArchiveFolder = useAppStore(s => s.selectArchiveFolder);
+  const businessProfile = useAppStore(s => s.businessProfile);
+
+  const [folderPickerMode, setFolderPickerMode] = useState<'source' | 'archive' | null>(null);
 
   const selectedPrinterType = useAppStore(s => s.selectedPrinterType);
   const selectedBluetoothDevice = useAppStore(s => s.selectedBluetoothDevice);
@@ -67,20 +73,80 @@ export default function SettingsScreen() {
   const [testingPrint, setTestingPrint] = useState(false);
   const [testSuccess, setTestSuccess] = useState<string | null>(null);
   const [checkingNow, setCheckingNow] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [permissionStatus, setPermissionStatus] = useState<'granted' | 'denied' | 'prompt' | 'unknown'>('unknown');
+  const [copiedEmail, setCopiedEmail] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    MonitoringService.getNotificationPermissionStatus()
+      .then(st => {
+        if (mounted && (st === 'granted' || st === 'denied' || st === 'requested')) {
+          setPermissionStatus(st === 'granted' ? 'granted' : 'denied');
+        }
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const handleCopyEmail = async () => {
+    if (!serviceAccountEmail) return;
+    try {
+      const ok = await MonitoringService.copyToClipboard(serviceAccountEmail);
+      if (ok) {
+        setCopiedEmail(true);
+        setTimeout(() => setCopiedEmail(false), 2500);
+      } else {
+        Alert.alert('Service Account Email', serviceAccountEmail, [{text: 'OK'}]);
+      }
+    } catch {
+      Alert.alert('Service Account Email', serviceAccountEmail, [{text: 'OK'}]);
+    }
+  };
+
+  const handleConnectOrReconnect = async () => {
+    if (isConnecting) return;
+    setIsConnecting(true);
+    setMonitoringError(null);
+    try {
+      await MonitoringService.reconnect();
+      const st = await MonitoringService.getNotificationPermissionStatus();
+      setPermissionStatus(st === 'granted' ? 'granted' : 'denied');
+    } catch (err: any) {
+      Alert.alert('Push Connection Failed', err?.message || String(err));
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  const handleRequestPermission = async () => {
+    const status = await MonitoringService.requestNotificationPermission();
+    if (status === 'granted') {
+      setPermissionStatus('granted');
+    } else {
+      setPermissionStatus('denied');
+      Alert.alert(
+        'Notifications Blocked',
+        'Enable notifications for Winsoft Print Station in Android Settings to receive bill alerts.',
+      );
+    }
+  };
 
   const handleToggleMonitoring = useCallback(async (value: boolean) => {
     if (value) {
       const status = await MonitoringService.requestNotificationPermission();
       if (status === 'denied') {
+        setPermissionStatus('denied');
         Alert.alert(
           'Notifications Blocked',
           'Enable notifications for Winsoft Print Station in Android Settings to receive bill alerts.',
         );
         return;
       }
+      setPermissionStatus('granted');
       enableMonitoring();
-      // Explicitly trigger registration now that monitoring is enabled.
-      // initialize() may have run before sourceFolderId was available.
       await MonitoringService.ensureRegistered();
     } else {
       disableMonitoring();
@@ -106,10 +172,10 @@ export default function SettingsScreen() {
 
   const fcmStatusLabel = (): string => {
     switch (fcmRegistrationStatus) {
-      case 'registered': return 'Registered ✓';
-      case 'registering': return 'Registering…';
-      case 'error': return 'Error';
-      default: return 'Not registered';
+      case 'registered': return 'Connected';
+      case 'registering': return 'Connecting…';
+      case 'error': return 'Disconnected / Error';
+      default: return 'Not Connected';
     }
   };
 
@@ -153,12 +219,92 @@ export default function SettingsScreen() {
     }
   };
 
+  const handleDevDebugThermal = () => {
+    if (__DEV__) {
+      const sampleReceipt: Receipt = {
+        transactionType: 'TAX INVOICE',
+        transactionNumber: 'TX-DEV-001',
+        date: new Date().toISOString().split('T')[0],
+        customer: {
+          name: 'Development Test Customer',
+          phone: '+971 50 000 0000',
+          address1: 'Test Address, Dubai',
+        },
+        items: [
+          {
+            sourceFields: {item: 'ITEM-001'},
+            description: 'Toyota Land Cruiser Front Brake Pad Assembly Genuine Replacement Premium',
+            quantity: 2,
+            rate: 45,
+            amount: 90,
+            unit: 'PCS',
+          },
+          {
+            sourceFields: {item: 'ITEM-002'},
+            description: 'Engine Oil 5W-40',
+            quantity: 1,
+            rate: 120,
+            amount: 120,
+            unit: 'LTR',
+            itemDiscount: 10,
+          },
+        ],
+        financials: {
+          subtotal: 210,
+          discountAmount: 10,
+          taxableAmount: 200,
+          vatAmount: 10,
+          vatRate: 5,
+          rounding: 0,
+          total: 210,
+        },
+        additional: {
+          salesman: 'Dev User',
+          trn: '123456789012345',
+          remarks: 'This is a simulated dev receipt.',
+        },
+        sourceRows: [],
+      };
+
+      const {businessProfile: storeBusinessProfile, thermalTemplate} = useAppStore.getState();
+      const bytes = buildThermalReceipt(sampleReceipt, storeBusinessProfile, thermalTemplate);
+      const debugText = debugEscPos(bytes);
+      
+      console.log('\n[WinPrint][THERMAL DEBUG]');
+      console.log(debugText);
+      console.log('[/WinPrint][THERMAL DEBUG]\n');
+      
+      Alert.alert(
+        'Dev Debug Generated',
+        'ESC/POS representation has been logged to the Metro console. Check your terminal output.',
+      );
+    }
+  };
+
   return (
     <SafeAreaView style={styles.safe} edges={['bottom']}>
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}>
+
+        {/* ── Admin Management ──────────────────────────────────────── */}
+        {authProfile?.role === 'admin' && (
+          <>
+            <SectionHeader title="Administration" />
+            <View style={styles.group}>
+              <SettingsRow
+                icon="shield-account-outline"
+                iconColor={Colors.error}
+                label="Access Management"
+                detail="Manage users and businesses"
+                onPress={() => navigation.navigate('AdminAccess')}
+                isFirst
+                isLast
+              />
+            </View>
+          </>
+        )}
 
         {/* ── Google Drive ─────────────────────────────────────────── */}
         <SectionHeader title="Google Drive" />
@@ -173,17 +319,62 @@ export default function SettingsScreen() {
           <SettingsRow
             icon="folder-google-drive"
             iconColor="#4285F4"
-            label="Source Folder"
-            detail={sourceFolderName ?? 'Not configured'}
+            label="Incoming Folder"
+            detail={
+              sourceFolderName
+                ? sourceFolderPath ?? sourceFolderName
+                : 'Tap to select incoming folder'
+            }
+            onPress={() => setFolderPickerMode('source')}
           />
           <SettingsRow
             icon="folder-move-outline"
             iconColor="#4285F4"
             label="Printed Folder"
-            detail="Not configured"
+            detail={
+              archiveFolderName
+                ? archiveFolderPath ?? archiveFolderName
+                : 'Tap to select printed folder'
+            }
+            onPress={() => setFolderPickerMode('archive')}
             isLast
           />
         </View>
+
+        {serviceAccountEmail ? (
+          <View style={styles.serviceAccountCard}>
+            <View style={styles.serviceAccountHeader}>
+              <Icon name="information-outline" size={18} color="#4285F4" />
+              <Text style={styles.serviceAccountTitle}>Drive Push Notifications</Text>
+            </View>
+            <Text style={styles.serviceAccountDesc}>
+              To receive instant notifications when bills arrive, please share your Incoming folder in Google Drive with this service account:
+            </Text>
+            <View style={styles.permissionReqBox}>
+              <Text style={styles.permissionReqText}>
+                Required Permission: <Text style={styles.permissionReqBold}>Viewer</Text>
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.serviceAccountEmailBox}
+              activeOpacity={0.7}
+              onPress={handleCopyEmail}>
+              <Text style={styles.serviceAccountEmailText} numberOfLines={1}>
+                {serviceAccountEmail}
+              </Text>
+              <View style={styles.copyButtonInner}>
+                <Icon
+                  name={copiedEmail ? 'check' : 'content-copy'}
+                  size={16}
+                  color={copiedEmail ? Colors.active : Colors.primary}
+                />
+                <Text style={[styles.copyButtonText, copiedEmail && {color: Colors.active}]}>
+                  {copiedEmail ? 'Copied' : 'Copy'}
+                </Text>
+              </View>
+            </TouchableOpacity>
+          </View>
+        ) : null}
 
         {/* ── Receipt Template ─────────────────────────────────────── */}
         <SectionHeader title="Receipt Template" style={styles.sectionGap} />
@@ -191,35 +382,13 @@ export default function SettingsScreen() {
           <SettingsRow
             icon="office-building-outline"
             iconColor={Colors.primary}
-            label="Business Information"
-            detail="Not configured"
+            label="Business & Receipt Setup"
+            detail={businessProfile.identity.businessName || 'Configure profile & templates'}
+            onPress={() => navigation.navigate('BusinessSetup')}
             isFirst
-          />
-          <SettingsRow
-            icon="image-outline"
-            iconColor={Colors.primary}
-            label="Logo"
-            detail="None"
-          />
-          <SettingsRow
-            icon="format-list-checks"
-            iconColor={Colors.primary}
-            label="Receipt Fields"
-            detail="Default"
-          />
-          <SettingsRow
-            icon="ruler-square"
-            iconColor={Colors.primary}
-            label="Paper Size"
-            detail="A4"
-          />
-          <SettingsRow
-            icon="text-box-outline"
-            iconColor={Colors.primary}
-            label="Footer Text"
-            detail="Not set"
             isLast
           />
+
         </View>
 
         {/* ── Printer ──────────────────────────────────────────────── */}
@@ -272,8 +441,100 @@ export default function SettingsScreen() {
             label={testingPrint ? 'Sending Test Print…' : 'Test Print'}
             detail={testingPrint ? 'Working…' : 'Tap to test'}
             onPress={handleTestPrint}
+            isLast={!(__DEV__ && selectedPrinterType === 'thermal')}
+          />
+          {__DEV__ && selectedPrinterType === 'thermal' && (
+            <SettingsRow
+              icon="bug-outline"
+              iconColor={Colors.active}
+              label="Dev Debug Receipt (Console)"
+              detail="Logs ESC/POS to Metro (No Bluetooth needed)"
+              onPress={handleDevDebugThermal}
+              isLast
+            />
+          )}
+        </View>
+
+        {printerError ? (
+          <View style={styles.printerErrorCard}>
+            <Icon name="alert-circle-outline" size={18} color={Colors.error} />
+            <Text style={styles.printerErrorText}>{printerError}</Text>
+            <TouchableOpacity onPress={clearPrinterError}>
+              <Icon name="close" size={16} color={Colors.textSecondary} />
+            </TouchableOpacity>
+          </View>
+        ) : null}
+
+
+        {/* ── BUSINESS GROUP ─────────────────────────────────── */}
+        <SectionHeader title="Business" style={styles.sectionGap} />
+        <View style={styles.group}>
+          <SettingsRow
+            icon="office-building-outline"
+            iconColor={Colors.primary}
+            label="Business Information"
+            detail={businessProfile.identity.businessName || 'Configure business profile'}
+            onPress={() => navigation.navigate('BusinessSetup')}
+            isFirst
+          />
+          <SettingsRow
+            icon="file-document-outline"
+            iconColor={Colors.primary}
+            label="Receipt Template"
+            detail="A4 and thermal receipt design"
+            onPress={() => navigation.navigate('BusinessSetup')}
             isLast
           />
+        </View>
+
+        {/* ── PRINTING GROUP ─────────────────────────────────── */}
+        <SectionHeader title="Printing" style={styles.sectionGap} />
+        <View style={styles.group}>
+          <SettingsRow
+            icon="printer-settings-outline"
+            iconColor={Colors.warning}
+            label="Office Printer"
+            detail={
+              selectedPrinterType === 'office'
+                ? 'Active — A4 via Android Print'
+                : 'Not selected'
+            }
+            onPress={() => setTypeModalVisible(true)}
+            isFirst
+          />
+          <SettingsRow
+            icon="printer-pos-outline"
+            iconColor={Colors.warning}
+            label="Thermal Printer"
+            detail={
+              selectedPrinterType === 'thermal'
+                ? selectedBluetoothDevice?.name ?? 'Active — select device'
+                : 'Not selected'
+            }
+            onPress={() => {
+              setPrinterType('thermal');
+              loadPairedDevices();
+              setDeviceModalVisible(true);
+            }}
+          />
+          <SettingsRow
+            icon="test-tube-outline"
+            iconColor={Colors.warning}
+            label={testingPrint ? 'Sending test…' : 'Test Print'}
+            detail="Send a test receipt to the active printer"
+            onPress={handleTestPrint}
+            isLast={!(__DEV__ && selectedPrinterType === 'thermal')}
+          />
+          {__DEV__ && selectedPrinterType === 'thermal' && (
+            <SettingsRow
+              icon="bug-outline"
+              iconColor={Colors.active}
+              label="Dev Debug Receipt (Console)"
+              detail="Logs ESC/POS to Metro"
+              onPress={handleDevDebugThermal}
+              isLast
+            />
+          )}
         </View>
 
         {printerError ? (
@@ -293,16 +554,98 @@ export default function SettingsScreen() {
           </View>
         ) : null}
 
-        {/* ── Monitoring ───────────────────────────────────────────── */}
-        <SectionHeader title="Monitoring" style={styles.sectionGap} />
+        {/* ── MONITORING GROUP ──────────────────────────────────── */}
+        <SectionHeader title="Bill Monitoring" style={styles.sectionGap} />
         <View style={styles.group}>
-          {/* Toggle */}
+          {/* Push Connection Status & Action Row */}
+          <View style={styles.pushConnectionRow}>
+            <View style={styles.pushConnectionLeft}>
+              <Icon name="access-point-network" size={24} color={fcmStatusColor()} />
+              <View style={styles.pushConnectionTexts}>
+                <Text style={styles.pushConnectionLabel}>Push Connection</Text>
+                <View style={styles.statusBadgeRow}>
+                  <Text style={[styles.statusBullet, {color: fcmStatusColor()}]}>
+                    {fcmRegistrationStatus === 'registered' ? '●' : '○'}
+                  </Text>
+                  <Text style={[styles.pushConnectionSub, {color: fcmStatusColor()}]}>
+                    {fcmStatusLabel()}
+                  </Text>
+                </View>
+              </View>
+            </View>
+
+            <TouchableOpacity
+              style={[
+                styles.connectButton,
+                fcmRegistrationStatus === 'registered' ? styles.reconnectButton : styles.connectActionButton,
+                (isConnecting || fcmRegistrationStatus === 'registering') && styles.connectButtonDisabled,
+              ]}
+              disabled={isConnecting || fcmRegistrationStatus === 'registering'}
+              onPress={handleConnectOrReconnect}
+              activeOpacity={0.7}>
+              {isConnecting || fcmRegistrationStatus === 'registering' ? (
+                <ActivityIndicator size="small" color="#ffffff" />
+              ) : (
+                <Text style={styles.connectButtonText}>
+                  {fcmRegistrationStatus === 'registered' ? 'Reconnect' : 'Connect'}
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
+
+          {/* Disconnected / Error Reason Banner */}
+          {fcmRegistrationStatus !== 'registered' && (
+            <View style={styles.pushReasonCard}>
+              <Icon name="alert-circle-outline" size={16} color={Colors.warning} />
+              <Text style={styles.pushReasonText}>
+                {permissionStatus === 'denied'
+                  ? 'Notification permission is disabled in Android settings.'
+                  : !sourceFolderId
+                  ? 'Incoming folder is not selected. Please select an Incoming folder above.'
+                  : lastMonitoringError
+                  ? lastMonitoringError
+                  : 'Tap Connect to register this device for push notifications.'}
+              </Text>
+            </View>
+          )}
+
+          <View style={styles.monitoringDivider} />
+
+          {/* Monitored Folder Row */}
+          <SettingsRow
+            icon="folder-google-drive"
+            iconColor="#4285F4"
+            label="Monitored Folder"
+            detail={
+              sourceFolderName
+                ? sourceFolderPath ?? sourceFolderName
+                : 'Not configured — select folder above'
+            }
+            onPress={() => setFolderPickerMode('source')}
+          />
+
+          {/* Notification Permission Row */}
+          <SettingsRow
+            icon="bell-badge-outline"
+            iconColor={permissionStatus === 'granted' ? Colors.active : Colors.warning}
+            label="Notification Permission"
+            detail={
+              permissionStatus === 'granted'
+                ? 'Enabled'
+                : permissionStatus === 'denied'
+                ? 'Disabled — tap to request'
+                : 'Check status'
+            }
+            onPress={handleRequestPermission}
+          />
+
+          {/* Monitoring Toggle */}
           <View style={styles.monitoringToggleRow}>
             <Icon name="radar" size={22} color={monitoringEnabled ? Colors.active : Colors.inactive} />
             <View style={styles.monitoringToggleContent}>
-              <Text style={styles.monitoringToggleLabel}>Notification Monitoring</Text>
+              <Text style={styles.monitoringToggleLabel}>Background Monitoring</Text>
               <Text style={styles.monitoringToggleSub}>
-                {monitoringEnabled ? 'Active — watching for new Winsoft bills' : 'Disabled'}
+                {monitoringEnabled ? 'Active — listening for webhook push alerts' : 'Disabled'}
               </Text>
             </View>
             <Switch
@@ -313,40 +656,22 @@ export default function SettingsScreen() {
             />
           </View>
 
-          {/* FCM Registration status */}
           <View style={styles.monitoringDivider} />
-          <SettingsRow
-            icon="broadcast"
-            iconColor={fcmStatusColor()}
-            label="FCM Registration"
-            detail={fcmStatusLabel()}
-          />
 
-          {/* Service account email — for folder sharing */}
-          {serviceAccountEmail ? (
-            <SettingsRow
-              icon="account-key-outline"
-              iconColor={Colors.textSecondary}
-              label="Share folder with"
-              detail={serviceAccountEmail}
-            />
-          ) : null}
-
-          {/* Timestamps */}
           <SettingsRow
             icon="bell-outline"
             iconColor={Colors.primary}
-            label="Last Drive Notification"
+            label="Last Bill Detected"
             detail={formatTimestamp(lastDriveNotificationAt)}
           />
+
           <SettingsRow
-            icon="timer-sync-outline"
-            iconColor={Colors.primary}
-            label="Last Reconciliation"
+            icon="clock-check-outline"
+            iconColor={Colors.textSecondary}
+            label="Last Push Check"
             detail={formatTimestamp(lastReconciliationAt)}
           />
 
-          {/* Error (dismissible) */}
           {lastMonitoringError ? (
             <View style={styles.monitoringErrorRow}>
               <Icon name="alert-circle-outline" size={16} color={Colors.error} />
@@ -359,7 +684,6 @@ export default function SettingsScreen() {
             </View>
           ) : null}
 
-          {/* Check Now */}
           <View style={styles.monitoringDivider} />
           <TouchableOpacity
             style={styles.checkNowButton}
@@ -372,32 +696,62 @@ export default function SettingsScreen() {
               <Icon name="magnify-scan" size={18} color={Colors.primary} />
             )}
             <Text style={styles.checkNowText}>
-              {checkingNow ? 'Checking…' : 'Check Now'}
+              {checkingNow ? 'Checking…' : 'Check Now (Reconciliation)'}
             </Text>
           </TouchableOpacity>
         </View>
 
-        {/* ── App ──────────────────────────────────────────────────── */}
-        <SectionHeader title="App" style={styles.sectionGap} />
+        {/* ── ACCOUNT GROUP ──────────────────────────────────── */}
+        <SectionHeader title="Account" style={styles.sectionGap} />
         <View style={styles.group}>
           <SettingsRow
-            icon="information-outline"
-            iconColor={Colors.textSecondary}
-            label="About"
-            detail="v0.1.0"
+            icon="account-circle-outline"
+            iconColor={user ? Colors.active : Colors.inactive}
+            label="Google Account"
+            detail={user ? user.email : 'Not signed in'}
             isFirst
           />
           <SettingsRow
-            icon="file-document-outline"
-            iconColor={Colors.textSecondary}
-            label="Logs"
+            icon="shield-check-outline"
+            iconColor={Colors.primary}
+            label="Access Status"
+            detail={authProfile?.status === 'active' ? 'Active' : authProfile?.status ?? 'Unknown'}
+          />
+          <SettingsRow
+            icon="logout"
+            iconColor={Colors.error}
+            label="Sign Out"
+            detail="Sign out of this account"
+            onPress={() => {
+              Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
+                {text: 'Cancel', style: 'cancel'},
+                {text: 'Sign Out', style: 'destructive', onPress: signOut},
+              ]);
+            }}
             isLast
           />
         </View>
 
-        {/* Build info */}
+        {/* ── ADMIN GROUP (admin role only) ───────────────────── */}
+        {authProfile?.role === 'admin' && (
+          <>
+            <SectionHeader title="Admin" style={styles.sectionGap} />
+            <View style={styles.group}>
+              <SettingsRow
+                icon="shield-account-outline"
+                iconColor={Colors.error}
+                label="Access Management"
+                detail="Manage users and businesses"
+                onPress={() => navigation.navigate('AdminAccess')}
+                isFirst
+                isLast
+              />
+            </View>
+          </>
+        )}
+
         <Text style={styles.buildInfo}>
-          Winsoft Print Station · Phase 1 · Build 1
+          Winsoft Print Station
         </Text>
 
         <View style={styles.bottomPad} />
@@ -604,6 +958,23 @@ export default function SettingsScreen() {
           </View>
         </View>
       </Modal>
+
+      {/* ── Nested Google Drive Folder Picker Modal ── */}
+      <DriveFolderPickerModal
+        visible={folderPickerMode !== null}
+        title={folderPickerMode === 'archive' ? 'Select Printed Folder' : 'Select Incoming Folder'}
+        accessToken={accessToken}
+        initialFolderId={folderPickerMode === 'archive' ? archiveFolderId : sourceFolderId}
+        initialFolderName={folderPickerMode === 'archive' ? archiveFolderName : sourceFolderName}
+        onSelect={folder => {
+          if (folderPickerMode === 'archive') {
+            selectArchiveFolder(folder);
+          } else {
+            void selectFolder(folder);
+          }
+        }}
+        onClose={() => setFolderPickerMode(null)}
+      />
     </SafeAreaView>
   );
 }
@@ -625,6 +996,77 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     ...Shadow.sm,
     marginTop: Spacing.xs,
+  },
+
+  serviceAccountCard: {
+    backgroundColor: '#E8F0FE',
+    borderColor: '#4285F455',
+    borderWidth: 1,
+    borderRadius: BorderRadius.md,
+    padding: Spacing.md,
+    marginTop: Spacing.sm,
+  },
+  serviceAccountHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs,
+    marginBottom: 4,
+  },
+  serviceAccountTitle: {
+    ...Typography.bodyMedium,
+    color: '#1A73E8',
+    fontWeight: '700',
+  },
+  serviceAccountDesc: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
+    marginBottom: Spacing.sm,
+    lineHeight: 18,
+  },
+  serviceAccountEmailBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#4285F488',
+    borderRadius: BorderRadius.sm,
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: 8,
+  },
+  serviceAccountEmailText: {
+    ...Typography.caption,
+    color: '#1A73E8',
+    fontWeight: '600',
+    flex: 1,
+    marginRight: Spacing.xs,
+  },
+  permissionReqBox: {
+    backgroundColor: '#D2E3FC',
+    borderRadius: BorderRadius.xs,
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: 4,
+    marginBottom: Spacing.sm,
+    alignSelf: 'flex-start',
+  },
+  permissionReqText: {
+    ...Typography.caption,
+    color: '#174EA6',
+  },
+  permissionReqBold: {
+    fontWeight: '700',
+    color: '#174EA6',
+  },
+  copyButtonInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingLeft: Spacing.xs,
+  },
+  copyButtonText: {
+    ...Typography.caption,
+    color: Colors.primary,
+    fontWeight: '600',
   },
 
   printerErrorCard: {
@@ -829,6 +1271,81 @@ const styles = StyleSheet.create({
   bottomPad: {height: Spacing.xl},
 
   // ── Monitoring panel ────────────────────────────────────────────────────
+  pushConnectionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: Colors.card,
+    padding: Spacing.md,
+  },
+  pushConnectionLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+    flex: 1,
+    marginRight: Spacing.sm,
+  },
+  pushConnectionTexts: {
+    flex: 1,
+  },
+  pushConnectionLabel: {
+    ...Typography.bodyMedium,
+    color: Colors.textPrimary,
+    fontWeight: '600',
+  },
+  statusBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 2,
+  },
+  statusBullet: {
+    fontSize: 12,
+  },
+  pushConnectionSub: {
+    ...Typography.caption,
+    fontWeight: '600',
+  },
+  connectButton: {
+    paddingHorizontal: Spacing.md,
+    paddingVertical: 7,
+    borderRadius: BorderRadius.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 88,
+  },
+  connectActionButton: {
+    backgroundColor: Colors.primary,
+  },
+  reconnectButton: {
+    backgroundColor: Colors.cardElevated,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  connectButtonDisabled: {
+    opacity: 0.6,
+  },
+  connectButtonText: {
+    ...Typography.caption,
+    color: Colors.textPrimary,
+    fontWeight: '700',
+  },
+  pushReasonCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs,
+    backgroundColor: `${Colors.warning}14`,
+    borderColor: `${Colors.warning}44`,
+    borderWidth: 1,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  pushReasonText: {
+    ...Typography.caption,
+    color: Colors.warning,
+    flex: 1,
+    lineHeight: 16,
+  },
   monitoringToggleRow: {
     flexDirection: 'row',
     alignItems: 'center',
