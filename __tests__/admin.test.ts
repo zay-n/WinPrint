@@ -96,7 +96,6 @@ jest.mock('@react-native-google-signin/google-signin', () => {
   const mockHasPlayServices = jest.fn().mockResolvedValue(true);
   const mockSignIn = jest.fn();
   const mockGetTokens = jest.fn().mockResolvedValue({
-    accessToken: 'mock_access_token',
     idToken: 'mock_id_token',
   });
   const mockGetCurrentUser = jest.fn();
@@ -166,7 +165,7 @@ describe('GoogleAuthService', () => {
   });
 
   describe('signIn()', () => {
-    it('returns AuthResult with idToken and accessToken on success', async () => {
+    it('returns user and idToken on success', async () => {
       mockSignIn.mockResolvedValue({
         type: 'success',
         data: {
@@ -178,7 +177,6 @@ describe('GoogleAuthService', () => {
       const result = await GoogleAuthService.signIn();
       expect(result.user.email).toBe('test@example.com');
       expect(result.idToken).toBe('test_id_token');
-      expect(result.accessToken).toBe('mock_access_token');
     });
 
     it('throws CANCELLED error when user cancels', async () => {
@@ -217,10 +215,10 @@ describe('GoogleAuthService', () => {
     });
   });
 
-  describe('getCurrentUser()', () => {
+  describe('getCurrentUserSync()', () => {
     it('returns null when no user is signed in', async () => {
       mockGetCurrentUser.mockReturnValue(null);
-      const result = await GoogleAuthService.getCurrentUser();
+      const result = GoogleAuthService.getCurrentUserSync();
       expect(result).toBeNull();
     });
 
@@ -229,8 +227,8 @@ describe('GoogleAuthService', () => {
         user: { id: 'gid', name: 'Test', email: 'test@example.com', photo: null },
         idToken: null,
       });
-      const result = await GoogleAuthService.getCurrentUser();
-      expect(result).toBeNull();
+      const result = GoogleAuthService.getCurrentUserSync();
+      expect(result?.email).toBe('test@example.com');
     });
 
     it('returns AuthResult when user is signed in with valid idToken', async () => {
@@ -238,10 +236,9 @@ describe('GoogleAuthService', () => {
         user: { id: 'gid', name: 'Test', email: 'test@example.com', photo: null },
         idToken: 'valid_id_token',
       });
-      const result = await GoogleAuthService.getCurrentUser();
+      const result = GoogleAuthService.getCurrentUserSync();
       expect(result).not.toBeNull();
-      expect(result?.user.email).toBe('test@example.com');
-      expect(result?.idToken).toBe('valid_id_token');
+      expect(result?.email).toBe('test@example.com');
     });
   });
 });

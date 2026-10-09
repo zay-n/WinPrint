@@ -11,7 +11,7 @@
  * Uses real store data. No fabricated metrics.
  */
 
-import React from 'react';
+import React, {useEffect, useState} from 'react';
 import {
   ScrollView,
   StatusBar,
@@ -26,6 +26,7 @@ import type {DashboardScreenProps} from '../../navigation/types';
 import Icon from '../../components/Icon';
 import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
 import {useAppStore} from '../../store/useAppStore';
+import * as MonitoringService from '../../services/monitoring/MonitoringService';
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
@@ -100,8 +101,15 @@ export default function DashboardScreen() {
   const user = useAppStore(s => s.user);
   const authProfile = useAppStore(s => s.authProfile);
   const customer = useAppStore(s => s.customer);
-  const accessToken = useAppStore(s => s.accessToken);
+  const driveNeedsReauth = useAppStore(s => s.driveNeedsReauth);
+  const driveAccessChecked = useAppStore(s => s.driveAccessChecked);
   const sourceFolderName = useAppStore(s => s.sourceFolderName);
+  const sourceFolderId = useAppStore(s => s.sourceFolderId);
+  const archiveFolderId = useAppStore(s => s.archiveFolderId);
+  const archiveFolderName = useAppStore(s => s.archiveFolderName);
+  const fcmRegistrationStatus = useAppStore(s => s.fcmRegistrationStatus);
+  const serviceAccountEmail = useAppStore(s => s.serviceAccountEmail);
+  const businessProfile = useAppStore(s => s.businessProfile);
   const queue = useAppStore(s => s.queue);
   const deferredFileIds = useAppStore(s => s.deferredFileIds);
   const monitoringEnabled = useAppStore(s => s.monitoringEnabled);
@@ -110,8 +118,16 @@ export default function DashboardScreen() {
   const lastDriveNotificationAt = useAppStore(s => s.lastDriveNotificationAt);
 
   const navigation = useNavigation<DashboardScreenProps['navigation']>();
+  const [notificationPermission, setNotificationPermission] = useState<string>('checking');
+  useEffect(() => {
+    let mounted = true;
+    MonitoringService.getNotificationPermissionStatus()
+      .then(status => { if (mounted) setNotificationPermission(status); })
+      .catch(() => { if (mounted) setNotificationPermission('unknown'); });
+    return () => { mounted = false; };
+  }, []);
 
-  const driveConnected = Boolean(user && accessToken);
+  const driveConnected = Boolean(user && driveAccessChecked && !driveNeedsReauth);
   const pendingCount = queue.filter(q => q.status === 'QUEUED' || q.status === 'PRINTING').length;
   const printedItems = queue.filter(q => q.status === 'PRINTED');
   const printedTodayCount = printedItems.filter(q => {
@@ -149,6 +165,22 @@ export default function DashboardScreen() {
   const printerReady =
     selectedPrinterType === 'office' ||
     (selectedPrinterType === 'thermal' && !!selectedBluetoothDevice);
+  const onboardingSteps = [
+    {label: 'Account approved and assigned', done: authProfile?.status === 'active' && !!authProfile.businessId && customer?.status === 'active', action: undefined as (() => void) | undefined},
+    {label: 'Incoming folder selected', done: !!sourceFolderId, action: () => navigation.navigate('Drive')},
+    {label: 'Printed/archive folder selected', done: !!archiveFolderId && archiveFolderId !== sourceFolderId, action: () => navigation.navigate('Drive')},
+    {label: 'Notifications allowed and device registered', done: fcmRegistrationStatus === 'registered' && (notificationPermission === 'granted' || notificationPermission === 'checking'), action: () => navigation.navigate('Settings')},
+    {label: 'Business profile reviewed', done: !!businessProfile.identity.businessName.trim() && !!businessProfile.contact.addressLine1.trim() && !!businessProfile.contact.phone.trim(), action: () => navigation.navigate('Settings', {screen: 'BusinessSetup'} as never)},
+    {label: 'Printer selected', done: printerReady, action: () => navigation.navigate('Settings')},
+    {label: 'Incoming folder shared with monitoring backend', done: fcmRegistrationStatus === 'registered' && !!serviceAccountEmail, action: () => navigation.navigate('Settings')},
+    {label: 'Monitoring enabled when ready', done: monitoringEnabled, action: () => navigation.navigate('Settings')},
+  ];
+  const onboardingReady = onboardingSteps.slice(0, 7).every(step => step.done);
+  onboardingSteps[7].done = monitoringEnabled && onboardingReady;
+  if (!onboardingReady) onboardingSteps[7].action = undefined;
+  // Monitoring can remain intentionally off for an otherwise configured
+  // existing installation; only missing setup configuration keeps this guide visible.
+  const needsOnboarding = onboardingSteps.slice(0, 7).some(step => !step.done);
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -182,6 +214,28 @@ export default function DashboardScreen() {
             <Icon name="cog-outline" size={22} color={Colors.textSecondary} />
           </Pressable>
         </View>
+
+        {needsOnboarding && (
+          <View style={styles.setupCard}>
+            <Text style={styles.setupTitle}>Welcome — finish your setup</Text>
+            <Text style={styles.setupDescription}>Signed in as {user?.email || 'your approved account'}. Complete these checks to prepare Drive, notifications, your business profile, and printer.</Text>
+            {onboardingSteps.map((step, index) => (
+              <View key={step.label} style={styles.setupRow}>
+                <Icon name={step.done ? 'check-circle' : 'circle-outline'} size={17} color={step.done ? Colors.active : Colors.textTertiary} />
+                <Text style={[styles.setupStepText, step.done && styles.setupStepDone]}>{index + 1}. {step.label}</Text>
+                {!step.done && step.action && <Pressable onPress={step.action} accessibilityRole="button"><Text style={styles.setupAction}>Open</Text></Pressable>}
+              </View>
+            ))}
+            <Text style={styles.setupNote}>
+              {serviceAccountEmail
+                ? `Monitoring service account: ${serviceAccountEmail}. Backend access is confirmed only when device registration succeeds.`
+                : 'The actual monitoring service-account email is returned by registerdevice after an Incoming folder is selected. It is not embedded in the app.'}
+            </Text>
+            {serviceAccountEmail && <Pressable onPress={() => void MonitoringService.copyToClipboard(serviceAccountEmail)}><Text style={styles.setupAction}>Copy service account email</Text></Pressable>}
+            <Text style={styles.setupNote}>The monitoring backend watches the Incoming folder. The Printed/archive folder is moved by this app using your Google Drive account; it does not need to be shared with the backend service account.</Text>
+            <Text style={styles.setupNote}>{onboardingReady ? 'Setup checks are ready. Enable Monitoring explicitly in Settings when you are ready.' : 'Monitoring stays off until account authorization, folder selection, notification registration, business information, and printer setup checks are complete.'}</Text>
+          </View>
+        )}
 
         {/* ── Monitoring Status ────────────────────────────────────────── */}
         <View style={[styles.monitoringCard, monitoringEnabled && styles.monitoringCardActive]}>
@@ -224,7 +278,7 @@ export default function DashboardScreen() {
             icon="google-drive"
             iconColor="#4285F4"
             title="Drive"
-            subtitle={driveConnected ? (sourceFolderName ?? 'No folder') : 'Not connected'}
+            subtitle={driveNeedsReauth ? 'Reconnect required' : driveConnected ? (sourceFolderName ?? 'No folder') : 'Not checked yet'}
             isActive={driveConnected}
             actionLabel={driveConnected ? undefined : 'Connect'}
             onAction={() => navigation.navigate('Drive')}
@@ -517,6 +571,14 @@ const styles = StyleSheet.create({
     color: Colors.primary,
     fontWeight: '700',
   },
+  setupCard: { backgroundColor: Colors.surface, borderRadius: BorderRadius.md, borderWidth: 1, borderColor: `${Colors.primary}55`, padding: Spacing.md, gap: Spacing.sm, ...Shadow.sm },
+  setupTitle: { ...Typography.bodyMedium, color: Colors.textPrimary, fontWeight: '700' },
+  setupDescription: { ...Typography.caption, color: Colors.textSecondary, lineHeight: 19 },
+  setupRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.xs },
+  setupStepText: { ...Typography.caption, color: Colors.textSecondary, flex: 1 },
+  setupStepDone: { color: Colors.active },
+  setupAction: { ...Typography.captionMedium, color: Colors.primary, fontWeight: '700' },
+  setupNote: { ...Typography.caption, color: Colors.textTertiary, lineHeight: 18 },
 
   // Status grid
   statusGrid: {

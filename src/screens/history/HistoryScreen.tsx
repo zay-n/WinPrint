@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Icon from '../../components/Icon';
 import { Colors, Spacing, BorderRadius, Typography, Shadow } from '../../theme';
@@ -9,16 +9,17 @@ import type { QueueItem, CsvProgress } from '../../store/useAppStore';
 export default function HistoryScreen() {
   const queue = useAppStore(s => s.queue);
   const csvProgress = useAppStore(s => s.csvProgress);
+  const reprintHistory = useAppStore(s => s.reprintHistory);
   const retryArchive = useAppStore(s => s.retryArchive);
   const clearHistory = useAppStore(s => s.clearHistory);
 
   const [tab, setTab] = useState<'receipts' | 'archives'>('receipts');
 
   const printedItems = queue.filter(q => q.status === 'PRINTED').reverse();
-  
+
   const csvProgressList = Object.values(csvProgress).sort((a, b) => {
     // Show failed first, then pending, then archived
-    const getOrder = (s: string) => s === 'FAILED' ? 0 : s === 'PENDING' ? 1 : 2;
+    const getOrder = (s: string) => s === 'FAILED' ? 0 : s === 'ARCHIVING' || s === 'PENDING' ? 1 : 2;
     return getOrder(a.archiveStatus) - getOrder(b.archiveStatus);
   });
 
@@ -55,7 +56,7 @@ export default function HistoryScreen() {
           data={printedItems}
           keyExtractor={item => item.identity}
           contentContainerStyle={styles.listContent}
-          renderItem={({ item }) => <HistoryItemRow item={item} />}
+          renderItem={({ item }) => <HistoryItemRow item={item} attempts={reprintHistory.filter(attempt => attempt.identity === item.identity)} />}
           ListEmptyComponent={
             <View style={styles.emptyState}>
               <Icon name="history" size={48} color={Colors.inactive} />
@@ -83,11 +84,13 @@ export default function HistoryScreen() {
   );
 }
 
-function HistoryItemRow({ item }: { item: QueueItem }) {
+function HistoryItemRow({ item, attempts }: { item: QueueItem; attempts: {attemptedAt: number; success: boolean; error?: string}[] }) {
+  const reprintReceipt = useAppStore(s => s.reprintReceipt);
+  const [printing, setPrinting] = React.useState(false);
   const printedAt = item.completedAt
     ? new Date(item.completedAt).toLocaleString([], {
-        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-      })
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    })
     : 'Unknown';
 
   return (
@@ -118,16 +121,47 @@ function HistoryItemRow({ item }: { item: QueueItem }) {
         </View>
       </View>
       <Text style={styles.itemDate}>
-        {printedAt}
+        {item.receipt.date || printedAt}
       </Text>
+      {attempts.length > 0 && (
+        <Text style={styles.itemDate}>
+          Reprints: {attempts.length} · Latest {attempts[attempts.length - 1].success ? 'succeeded' : 'failed'} ({new Date(attempts[attempts.length - 1].attemptedAt).toLocaleString()})
+        </Text>
+      )}
+      <Pressable
+        style={({ pressed }) => [styles.retryBtn, pressed && styles.pressed, printing && { opacity: 0.6 }]}
+        disabled={printing}
+        accessibilityRole="button"
+        accessibilityLabel={`Reprint ${item.receipt.transactionType} ${item.receipt.transactionNumber}`}
+        onPress={() => Alert.alert(
+          'Reprint receipt?',
+          `${item.receipt.transactionType} ${item.receipt.transactionNumber}${item.receipt.customer.name ? ` for ${item.receipt.customer.name}` : ''}`,
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Reprint', onPress: async () => {
+              setPrinting(true);
+              try {
+                const result = await reprintReceipt(item.identity);
+                Alert.alert(result.success ? 'Reprint sent' : 'Reprint failed', result.success ? 'The saved receipt was sent to the selected printer.' : (result.error || 'The printer could not print this receipt.'));
+              } finally {
+                setPrinting(false);
+              }
+            } },
+          ],
+        )}>
+        {printing ? <ActivityIndicator size="small" color={Colors.primary} /> : <Icon name="printer" size={16} color={Colors.primary} />}
+        <Text style={[styles.retryBtnText, { color: Colors.primary }]}>{printing ? 'Reprinting…' : 'Reprint'}</Text>
+      </Pressable>
     </View>
   );
 }
 
 function ArchiveProgressRow({ item, onRetry }: { item: CsvProgress; onRetry: () => void }) {
   const isFailed = item.archiveStatus === 'FAILED';
-  const isPending = item.archiveStatus === 'PENDING';
-  const statusLabel = isFailed ? 'Archive failed' : isPending ? 'Archiving...' : 'Archived';
+  const isPending = item.archiveStatus === 'PENDING' || item.archiveStatus === 'ARCHIVING';
+  const statusLabel = isFailed ? 'Archive failed' : isPending
+    ? (item.printedCount >= item.expectedCount ? 'Printed — Archive Pending' : 'Waiting to print')
+    : 'Archived';
 
   return (
     <View style={[styles.itemCard, isFailed && styles.itemCardFailed]}>
@@ -149,7 +183,7 @@ function ArchiveProgressRow({ item, onRetry }: { item: CsvProgress; onRetry: () 
       <Text style={styles.itemDetails}>
         Printed: {item.printedCount} of {item.expectedCount} transactions
       </Text>
-      
+
       {isFailed && item.archiveError && (
         <Text style={styles.itemError}>{item.archiveError}</Text>
       )}

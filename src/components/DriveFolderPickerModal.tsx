@@ -27,6 +27,8 @@ import Icon from './Icon';
 import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../theme';
 import * as DriveService from '../services/drive/DriveService';
 import type {DriveFile} from '../services/drive/DriveClient';
+import {DriveAuthError} from '../services/drive/DriveClient';
+import {useAppStore} from '../store/useAppStore';
 
 interface FolderStackItem {
   id: string;
@@ -42,7 +44,6 @@ export interface SelectedFolderResult {
 interface DriveFolderPickerModalProps {
   visible: boolean;
   title: string;
-  accessToken: string | null;
   initialFolderId?: string | null;
   initialFolderName?: string | null;
   onSelect: (folder: SelectedFolderResult) => void;
@@ -52,7 +53,6 @@ interface DriveFolderPickerModalProps {
 export default function DriveFolderPickerModal({
   visible,
   title,
-  accessToken,
   initialFolderId,
   initialFolderName,
   onSelect,
@@ -70,22 +70,24 @@ export default function DriveFolderPickerModal({
 
   // Fetch children whenever current folder changes or modal opens
   const fetchFolders = useCallback(async (parentId: string) => {
-    if (!accessToken) {
-      setError('Not signed in to Google Drive.');
-      return;
-    }
     setLoading(true);
     setError(null);
     try {
-      const items = await DriveService.listFolders(accessToken, parentId);
+      const items = await DriveService.listFolders(parentId);
       setFolders(items);
+      useAppStore.setState({driveAccessChecked: true, driveNeedsReauth: false});
     } catch (e: unknown) {
       const err = e as {message?: string};
+      if (e instanceof DriveAuthError) {
+        useAppStore.setState({driveNeedsReauth: true, driveAccessChecked: true});
+        setError('Google Drive authorization needs attention. Reconnect Google Drive in Settings.');
+        return;
+      }
       setError(err?.message ?? 'Failed to load folders.');
     } finally {
       setLoading(false);
     }
-  }, [accessToken]);
+  }, []);
 
   // Reset or initialize stack when modal becomes visible
   useEffect(() => {

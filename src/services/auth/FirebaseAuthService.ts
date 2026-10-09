@@ -10,6 +10,7 @@
 import {
   getAuth,
   GoogleAuthProvider,
+  onAuthStateChanged,
   signInWithCredential as firebaseSignInWithCredential,
   signOut as firebaseSignOut,
 } from '@react-native-firebase/auth';
@@ -111,6 +112,37 @@ export async function signInWithGoogleToken(idToken: string): Promise<string> {
   const googleCredential = GoogleAuthProvider.credential(idToken);
   const userCredential = await firebaseSignInWithCredential(getAuth(), googleCredential);
   return userCredential.user.uid;
+}
+
+/** Resolve only after Firebase has emitted its initial restored auth state. */
+export function waitForInitialAuthState(): Promise<NonNullable<ReturnType<typeof getAuth>['currentUser']> | null> {
+  const auth = getAuth();
+  return new Promise((resolve, reject) => {
+    let unsubscribe = () => {};
+    unsubscribe = onAuthStateChanged(
+      auth,
+      user => {
+        unsubscribe();
+        resolve(user);
+      },
+      error => {
+        unsubscribe();
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Current Firebase identity used to reject stale app authorization after account changes. */
+export function getCurrentFirebaseUserUid(): string | null {
+  return getAuth().currentUser?.uid ?? null;
+}
+
+/** Subscribe to later Firebase identity changes after initial restoration. */
+export function subscribeToAuthState(
+  listener: (user: ReturnType<typeof getAuth>['currentUser']) => void,
+): () => void {
+  return onAuthStateChanged(getAuth(), listener);
 }
 
 /**

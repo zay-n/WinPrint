@@ -35,6 +35,7 @@ describe('Folder Persistence & Canonical Configuration', () => {
     jest.clearAllMocks();
     useAppStore.setState({
       accessToken: 'test-access-token',
+      user: {id: 'user-1', email: 'user@example.com', name: 'User', photo: null},
       sourceFolderId: null,
       sourceFolderName: null,
       sourceFolderPath: null,
@@ -110,12 +111,13 @@ describe('Folder Persistence & Canonical Configuration', () => {
   test('5. validateSavedFolders keeps valid folders and updates renamed folder name', async () => {
     useAppStore.setState({
       sourceFolderId: 'valid-folder-id',
+      user: {id: 'user-1', email: 'user@example.com', name: 'User', photo: null},
       sourceFolderName: 'Old Name',
       archiveFolderId: 'valid-archive-id',
       archiveFolderName: 'Old Archive',
     });
 
-    (DriveService.getFileMetadata as jest.Mock).mockImplementation((_token, id) => {
+    (DriveService.getFileMetadata as jest.Mock).mockImplementation((id) => {
       if (id === 'valid-folder-id') {
         return Promise.resolve({
           id: 'valid-folder-id',
@@ -148,6 +150,7 @@ describe('Folder Persistence & Canonical Configuration', () => {
   test('6. validateSavedFolders flags deleted/inaccessible folder without silently overwriting', async () => {
     useAppStore.setState({
       sourceFolderId: 'deleted-folder-id',
+      user: {id: 'user-1', email: 'user@example.com', name: 'User', photo: null},
       sourceFolderName: 'Incoming',
     });
 

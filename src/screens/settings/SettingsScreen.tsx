@@ -32,7 +32,10 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
   const user = useAppStore(s => s.user);
   const authProfile = useAppStore(s => s.authProfile);
   const signOut = useAppStore(s => s.signOut);
-  const accessToken = useAppStore(s => s.accessToken);
+  const driveNeedsReauth = useAppStore(s => s.driveNeedsReauth);
+  const driveAccessChecked = useAppStore(s => s.driveAccessChecked);
+  const reconnectGoogleDrive = useAppStore(s => s.reconnectGoogleDrive);
+  const [reconnectingDrive, setReconnectingDrive] = useState(false);
   const sourceFolderId = useAppStore(s => s.sourceFolderId);
   const sourceFolderName = useAppStore(s => s.sourceFolderName);
   const sourceFolderPath = useAppStore(s => s.sourceFolderPath);
@@ -136,22 +139,28 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
 
   const handleToggleMonitoring = useCallback(async (value: boolean) => {
     if (value) {
-      const status = await MonitoringService.requestNotificationPermission();
-      if (status === 'denied') {
-        setPermissionStatus('denied');
-        Alert.alert(
-          'Notifications Blocked',
-          'Enable notifications for Winsoft Print Station in Android Settings to receive bill alerts.',
-        );
-        return;
+      try {
+        const status = await MonitoringService.requestNotificationPermission();
+        if (status === 'denied') {
+          setPermissionStatus('denied');
+          Alert.alert(
+            'Notifications Blocked',
+            'Enable notifications for Winsoft Print Station in Android Settings to receive bill alerts.',
+          );
+          return;
+        }
+        setPermissionStatus('granted');
+        enableMonitoring();
+        await MonitoringService.ensureRegistered();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setMonitoringError(`Could not enable background monitoring: ${message}`);
+        Alert.alert('Monitoring Could Not Be Enabled', message);
       }
-      setPermissionStatus('granted');
-      enableMonitoring();
-      await MonitoringService.ensureRegistered();
     } else {
       disableMonitoring();
     }
-  }, [enableMonitoring, disableMonitoring]);
+  }, [enableMonitoring, disableMonitoring, setMonitoringError]);
 
   const handleCheckNow = useCallback(async () => {
     setCheckingNow(true);
@@ -316,6 +325,32 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
             detail={user ? user.email : 'Not signed in'}
             isFirst
           />
+          <SettingsRow
+            icon="google-drive"
+            iconColor={driveNeedsReauth ? Colors.error : driveAccessChecked ? Colors.active : Colors.inactive}
+            label="Google Drive"
+            detail={reconnectingDrive
+                ? 'Checking Drive access…'
+                : driveNeedsReauth
+                  ? 'Reconnect required'
+                : driveAccessChecked
+                  ? 'Drive access available'
+                  : 'Not checked yet'}
+          />
+          {user && (driveNeedsReauth || !driveAccessChecked) ? (
+            <SettingsRow
+              icon="refresh"
+              iconColor="#4285F4"
+              label={reconnectingDrive ? 'Reconnecting…' : 'Reconnect Google Drive'}
+              detail="Restore Drive access without signing out"
+              onPress={async () => {
+                if (reconnectingDrive) return;
+                setReconnectingDrive(true);
+                try { await reconnectGoogleDrive(); }
+                finally { setReconnectingDrive(false); }
+              }}
+            />
+          ) : null}
           <SettingsRow
             icon="folder-google-drive"
             iconColor="#4285F4"
@@ -963,7 +998,6 @@ export default function SettingsScreen({navigation}: SettingsScreenProps) {
       <DriveFolderPickerModal
         visible={folderPickerMode !== null}
         title={folderPickerMode === 'archive' ? 'Select Printed Folder' : 'Select Incoming Folder'}
-        accessToken={accessToken}
         initialFolderId={folderPickerMode === 'archive' ? archiveFolderId : sourceFolderId}
         initialFolderName={folderPickerMode === 'archive' ? archiveFolderName : sourceFolderName}
         onSelect={folder => {

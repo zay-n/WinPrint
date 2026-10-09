@@ -11,6 +11,13 @@
  *    have the app's signing certificate SHA-1 registered.
  *    Debug SHA-1:   5E:8F:16:06:2E:A3:CD:2C:4A:0D:54:78:76:BA:A6:F3:8C:AB:F6:25
  *    Release SHA-1: C6:D1:EA:87:36:38:3D:99:E6:22:76:E2:C4:17:58:46:CE:27:1B:91
+ *
+ * AUTH ARCHITECTURE:
+ *  - Firebase Auth is the authoritative application session.
+ *  - Google Sign-In is the identity provider used to establish/refresh credentials.
+ *  - On app restart: Firebase onAuthStateChanged restores the session.
+ *  - Google Sign-In tokens are obtained on-demand for Drive API calls.
+ *  - Short-lived access tokens are NEVER persisted to AsyncStorage/Zustand.
  */
 
 import {
@@ -33,6 +40,12 @@ const DRIVE_READONLY_SCOPE =
   'https://www.googleapis.com/auth/drive.readonly';
 
 // ---------------------------------------------------------------------------
+// Configuration state — configure() must be called before any other method.
+// It is safe to call multiple times; native layer is idempotent.
+// ---------------------------------------------------------------------------
+let _configured = false;
+
+// ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 
@@ -45,8 +58,6 @@ export interface GoogleUser {
 
 export interface AuthResult {
   user: GoogleUser;
-  /** OAuth access token — used for Drive API calls. */
-  accessToken: string;
   /** Google ID token — used for Firebase Authentication. */
   idToken: string;
 }
@@ -59,6 +70,7 @@ export interface AuthError {
 /**
  * Configure Google Sign-In. Safe to call multiple times.
  * Always re-applies configuration so stale state cannot persist.
+ * Call this once at app startup before any other method.
  */
 export function configure(): void {
   GoogleSignin.configure({
@@ -66,11 +78,13 @@ export function configure(): void {
     scopes: [DRIVE_READONLY_SCOPE],
     offlineAccess: false,
   });
+  _configured = true;
 }
 
 /**
  * Sign in interactively. Opens the Google account picker.
  * Returns AuthResult on success or throws AuthError.
+ * NOTE: Does NOT return accessToken — use getValidAccessToken() for Drive calls.
  */
 export async function signIn(): Promise<AuthResult> {
   configure();
@@ -81,7 +95,6 @@ export async function signIn(): Promise<AuthResult> {
     if (!isSuccessResponse(userInfo)) {
       throw { code: statusCodes.SIGN_IN_CANCELLED, message: 'Sign-in was cancelled.' };
     }
-    const tokens = await GoogleSignin.getTokens();
 
     const idToken = userInfo.data.idToken;
     if (!idToken) {
@@ -95,6 +108,8 @@ export async function signIn(): Promise<AuthResult> {
       };
     }
 
+    console.log('[WinPrint][Auth] Google Sign-In: account selected, idToken obtained');
+
     return {
       user: {
         id: userInfo.data.user.id,
@@ -102,7 +117,6 @@ export async function signIn(): Promise<AuthResult> {
         email: userInfo.data.user.email,
         photo: userInfo.data.user.photo,
       },
-      accessToken: tokens.accessToken,
       idToken,
     };
   } catch (error: unknown) {
@@ -136,10 +150,11 @@ export async function signIn(): Promise<AuthResult> {
 }
 
 /**
- * Sign out and clear session.
+ * Sign out from Google Sign-In and clear native session.
  */
 export async function signOut(): Promise<void> {
   configure();
+  _configured = false; // Reset so next configure() re-applies cleanly
   try {
     await GoogleSignin.signOut();
   } catch (error: unknown) {
@@ -148,32 +163,65 @@ export async function signOut(): Promise<void> {
 }
 
 /**
- * Check if a user is currently signed in and return their tokens.
- * Returns null if not signed in.
+ * Attempt a silent sign-in for an already-authenticated user.
+ * Returns the idToken if successful, or null if silent sign-in is unavailable.
+ * This is used ONLY to get a fresh idToken for Firebase — not for Drive tokens.
+ *
+ * NOTE: On app restart, prefer Firebase onAuthStateChanged over this.
+ * Only use this if Firebase reports no current user but Google session exists.
  */
-export async function getCurrentUser(): Promise<AuthResult | null> {
+export async function signInSilently(): Promise<AuthResult | null> {
   configure();
   try {
-    const userInfo = GoogleSignin.getCurrentUser();
-    if (!userInfo) {
+    const hasPrevious = GoogleSignin.hasPreviousSignIn();
+    if (!hasPrevious) {
+      console.log('[WinPrint][Auth] Google: no previous sign-in detected');
       return null;
     }
-    const tokens = await GoogleSignin.getTokens();
-    const idToken = userInfo.idToken;
+
+    const userInfo = await GoogleSignin.signInSilently();
+    if (!userInfo || !('data' in userInfo) || !userInfo.data) {
+      return null;
+    }
+
+    const idToken = userInfo.data.idToken;
     if (!idToken) {
-      // Cannot restore session without an idToken — require fresh sign-in
-      console.warn('[WinPrint][GoogleAuth] getCurrentUser: no idToken available; requiring fresh sign-in.');
+      console.warn('[WinPrint][Auth] Google signInSilently: no idToken returned');
       return null;
     }
+
+    console.log('[WinPrint][Auth] Google: silent sign-in succeeded');
     return {
       user: {
-        id: userInfo.user.id,
-        name: userInfo.user.name ?? null,
-        email: userInfo.user.email,
-        photo: userInfo.user.photo ?? null,
+        id: userInfo.data.user.id,
+        name: userInfo.data.user.name,
+        email: userInfo.data.user.email,
+        photo: userInfo.data.user.photo,
       },
-      accessToken: tokens.accessToken,
       idToken,
+    };
+  } catch (error: unknown) {
+    const e = error as { code?: string; message?: string };
+    // Silent sign-in failure is non-fatal — Firebase session takes precedence
+    console.warn('[WinPrint][Auth] Google signInSilently failed:', e?.code, e?.message);
+    return null;
+  }
+}
+
+/**
+ * Get the currently cached Google user info (synchronous — no network call).
+ * Returns null if no user is signed in according to the native layer.
+ */
+export function getCurrentUserSync(): GoogleUser | null {
+  if (!_configured) configure();
+  try {
+    const userInfo = GoogleSignin.getCurrentUser();
+    if (!userInfo) return null;
+    return {
+      id: userInfo.user.id,
+      name: userInfo.user.name ?? null,
+      email: userInfo.user.email,
+      photo: userInfo.user.photo ?? null,
     };
   } catch {
     return null;
@@ -181,16 +229,81 @@ export async function getCurrentUser(): Promise<AuthResult | null> {
 }
 
 /**
- * Get a fresh access token for an already-signed-in user.
- * Refreshes silently if needed.
+ * Get a valid Drive access token for the currently signed-in Google account.
+ *
+ * This is the ONLY method that should be used to obtain access tokens for
+ * Google Drive API calls. It always calls getTokens() on the native layer,
+ * which returns a cached-but-fresh token (the native SDK handles refresh
+ * automatically).
+ *
+ * ACCESS TOKENS ARE NEVER STORED IN ZUSTAND OR ASYNCSTORAGE.
+ * They are fetched on-demand here for every Drive request.
+ *
+ * Returns null if no Google account is currently signed in.
  */
-export async function getAccessToken(): Promise<string | null> {
-  configure();
+export async function getValidAccessToken(): Promise<string | null> {
+  if (!_configured) configure();
   try {
+    // GoogleSignin.getTokens() handles token refresh natively.
     const tokens = await GoogleSignin.getTokens();
-    return tokens.accessToken;
-  } catch {
+    if (tokens.accessToken) return tokens.accessToken;
+  } catch (error: unknown) {
+    const e = error as { code?: string; message?: string };
+    console.warn('[WinPrint][Auth] getTokens failed; checking for a restorable Google session:', e?.code, e?.message);
+  }
+
+  // A Firebase session can outlive the native Google user cache. Make one
+  // silent restoration attempt when Google reports a prior account; never
+  // open interactive UI from a Drive request.
+  try {
+    if (!GoogleSignin.hasPreviousSignIn()) return null;
+    const silent = await GoogleSignin.signInSilently();
+    if (!silent || !('data' in silent) || !silent.data) return null;
+    const tokens = await GoogleSignin.getTokens();
+    return tokens.accessToken || null;
+  } catch (error: unknown) {
+    const e = error as { code?: string; message?: string };
+    console.warn('[WinPrint][Auth] Silent Drive authorization restore failed:', e?.code, e?.message);
     return null;
+  }
+}
+
+/** Canonical name used by DriveClient for Drive-scoped OAuth credentials. */
+export const getValidDriveAccessToken = getValidAccessToken;
+
+/**
+ * Clear the cached Google OAuth access token.
+ *
+ * Call this when a Drive API request returns HTTP 401, before retrying.
+ * The native Google Sign-In SDK will obtain a fresh token on the next
+ * getTokens() call.
+ */
+export async function clearCachedAccessToken(): Promise<void> {
+  if (!_configured) configure();
+  try {
+    // getTokens() first to get the current token value for clearCachedToken()
+    const tokens = await GoogleSignin.getTokens();
+    if (tokens.accessToken) {
+      await GoogleSignin.clearCachedAccessToken(tokens.accessToken);
+      console.log('[WinPrint][Auth] Drive token cache cleared for 401 retry');
+    }
+  } catch (error: unknown) {
+    // Non-fatal — best effort cache clear
+    const e = error as { code?: string; message?: string };
+    console.warn('[WinPrint][Auth] clearCachedAccessToken failed (non-fatal):', e?.code, e?.message);
+  }
+}
+
+/**
+ * Returns true if the native Google Sign-In layer has a previous sign-in
+ * (may still need a token refresh — use getValidAccessToken() to get the token).
+ */
+export function hasPreviousSignIn(): boolean {
+  if (!_configured) configure();
+  try {
+    return GoogleSignin.hasPreviousSignIn();
+  } catch {
+    return false;
   }
 }
 

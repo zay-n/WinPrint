@@ -2,28 +2,41 @@
  * useAppStore.ts — Zustand application state
  *
  * Manages slices for Auth, Drive, CSV, PDF, Printer, Queue, and Monitoring.
+ *
+ * AUTH ARCHITECTURE:
+ *  - Firebase Auth is the authoritative session. onAuthStateChanged drives
+ *    the restoreSession lifecycle on app restart.
+ *  - Google Sign-In is used only as the identity provider (sign-in flow)
+ *    and to obtain fresh Drive access tokens on-demand via DriveClient.
+ *  - Access tokens are NEVER stored in Zustand or AsyncStorage.
+ *  - driveNeedsReauth: true signals the "Reconnect Google Drive" UI path
+ *    when Drive API returns a persistent 401 after one retry.
  */
 
-import {create} from 'zustand';
-import {persist, createJSONStorage} from 'zustand/middleware';
+import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import type {GoogleUser, AuthResult} from '../services/auth/GoogleAuthService';
+import type { GoogleUser } from '../services/auth/GoogleAuthService';
 import * as GoogleAuthService from '../services/auth/GoogleAuthService';
-import type {UserProfile, Customer} from '../services/auth/FirebaseAuthService';
+import type { UserProfile, Customer } from '../services/auth/FirebaseAuthService';
 import * as FirebaseAuthService from '../services/auth/FirebaseAuthService';
 import * as DriveService from '../services/drive/DriveService';
-import type {DriveFile} from '../services/drive/DriveClient';
-import type {Receipt} from '../models/Receipt';
-import type {BusinessProfile, A4Template, ThermalTemplate} from '../models/Profile';
-import {DEFAULT_BUSINESS_PROFILE, DEFAULT_A4_TEMPLATE, DEFAULT_THERMAL_TEMPLATE} from '../models/Profile';
+import type { DriveFile } from '../services/drive/DriveClient';
+import { DriveAuthError } from '../services/drive/DriveClient';
+import type { Receipt } from '../models/Receipt';
+import type { BusinessProfile, A4Template, ThermalTemplate } from '../models/Profile';
+import { DEFAULT_BUSINESS_PROFILE, DEFAULT_A4_TEMPLATE, DEFAULT_THERMAL_TEMPLATE } from '../models/Profile';
 import * as ReceiptPdfService from '../services/pdf/ReceiptPdfService';
 import type {
   PrinterType,
   BluetoothDevice,
   PrintResult,
 } from '../services/printer/PrinterAdapter';
-import {PrinterService} from '../services/printer/PrinterService';
+import { PrinterService } from '../services/printer/PrinterService';
 import * as MonitoringService from '../services/monitoring/MonitoringService';
+
+const archiveMovesInFlight = new Set<string>();
+const reprintsInFlight = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // Profile slice
@@ -46,10 +59,22 @@ interface ProfileActions {
 // Auth slice
 // ---------------------------------------------------------------------------
 
+/**
+ * Auth state machine:
+ *  restoreSessionLoading=true  → AUTH_CHECKING   (show loading spinner)
+ *  user !== null               → AUTHENTICATED   (may show blocked screens)
+ *  user === null (after check) → UNAUTHENTICATED  (show sign-in screen)
+ *  signInError !== null        → AUTH_ERROR       (show error + retry)
+ *
+ * Drive state:
+ *  driveNeedsReauth=false → DRIVE_CONNECTED (normal operation)
+ *  driveNeedsReauth=true  → DRIVE_NEEDS_REAUTH (show reconnect button)
+ */
 interface AuthState {
   user: GoogleUser | null;
   authProfile: UserProfile | null;
   customer: Customer | null;
+  /** @deprecated Access tokens are no longer stored. Use DriveClient internally. */
   accessToken: string | null;
   signInLoading: boolean;
   restoreSessionLoading: boolean;
@@ -60,6 +85,7 @@ interface AuthActions {
   signIn: () => Promise<void>;
   signOut: () => Promise<void>;
   restoreSession: () => Promise<void>;
+  reconnectGoogleDrive: () => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +116,13 @@ interface DriveState {
   foldersLoading: boolean;
   csvLoading: boolean;
   driveError: string | null;
+  /**
+   * True when a Drive API call returned a persistent 401 after one retry.
+   * The UI should show a "Reconnect Google Drive" button.
+   */
+  driveNeedsReauth: boolean;
+  /** True only after a successful Drive request in the current app session. */
+  driveAccessChecked: boolean;
 }
 
 export type FolderSelection = {
@@ -182,22 +215,33 @@ export interface CsvProgress {
   sourceFolderId: string;
   expectedCount: number;
   printedCount: number;
-  archiveStatus: 'PENDING' | 'ARCHIVED' | 'FAILED';
+  archiveStatus: 'PENDING' | 'ARCHIVING' | 'ARCHIVED' | 'FAILED';
   archiveError?: string;
+}
+
+export interface ReprintAttempt {
+  identity: string;
+  attemptedAt: number;
+  success: boolean;
+  error?: string;
 }
 
 interface QueueState {
   queue: QueueItem[];
   csvProgress: Record<string, CsvProgress>;
+  reprintHistory: ReprintAttempt[];
 }
 
 interface QueueActions {
   enqueueReceipt: (receipt: Receipt) => void;
+  prepareCsvForQueue: (driveFileId: string, sourceFolderId: string, expectedCount: number) => void;
   updateQueueItemStatus: (identity: string, status: PrintStatus, error?: string) => Promise<void>;
   retryFailedPrints: () => void;
   retryArchive: (driveFileId: string) => Promise<void>;
+  resumePendingArchives: () => Promise<void>;
   clearHistory: () => void;
   processQueue: () => Promise<void>;
+  reprintReceipt: (identity: string) => Promise<PrintResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +348,7 @@ export const useAppStore = create<AppStore>()(
       user: null,
       authProfile: null,
       customer: null,
-      accessToken: null,
+      accessToken: null, // kept for compat but never populated; Drive uses on-demand tokens
       signInLoading: false,
       restoreSessionLoading: false,
       signInError: null,
@@ -312,93 +356,83 @@ export const useAppStore = create<AppStore>()(
       // ── Auth actions ────────────────────────────────────────────────────────
 
       signIn: async () => {
-        set({signInLoading: true, signInError: null});
+        set({ signInLoading: true, signInError: null });
         try {
-          // ── STAGE 1: Google Sign-In ────────────────────────────────────────
-          console.log('[WinPrint][SignIn] STAGE 1: Starting Google Sign-In');
-          let result: AuthResult;
+          // ── STAGE 1: Configure Google Sign-In ─────────────────────────────
+          // configure() must be called before signIn() so the native module
+          // is fully initialized. It is idempotent.
+          GoogleAuthService.configure();
+
+          // ── STAGE 2: Google Sign-In ────────────────────────────────────────
+          console.log('[WinPrint][Auth] STAGE 1: Starting Google Sign-In');
+          let result: import('../services/auth/GoogleAuthService').AuthResult;
           try {
             result = await GoogleAuthService.signIn();
-            console.log('[WinPrint][SignIn] STAGE 1 OK: Google account selected');
-            console.log('[WinPrint][SignIn]   user.email:', result.user.email);
-            console.log('[WinPrint][SignIn]   has idToken:', !!result.idToken);
-            console.log('[WinPrint][SignIn]   has accessToken:', !!result.accessToken);
+            console.log('[WinPrint][Auth] STAGE 1 OK: Google account selected, email:', result.user.email);
             if (!result.idToken) {
-              console.error('[WinPrint][SignIn] ERROR: idToken is null/undefined after Google Sign-In');
+              console.error('[WinPrint][Auth] ERROR: idToken is null/undefined after Google Sign-In');
               throw new Error('Google Sign-In returned no ID token. Cannot authenticate with Firebase.');
             }
           } catch (googleErr: unknown) {
-            const ge = googleErr as {code?: string; message?: string};
-            console.error('[WinPrint][SignIn] STAGE 1 FAILED: Google Sign-In error');
-            console.error('[WinPrint][SignIn]   code:', ge?.code);
-            console.error('[WinPrint][SignIn]   message:', ge?.message);
-            // Don't log further if cancelled (expected user action)
+            const ge = googleErr as { code?: string; message?: string };
             if (ge?.code === 'CANCELLED' || ge?.code === 'SIGN_IN_CANCELLED') {
-              console.log('[WinPrint][SignIn]   → User cancelled account picker (not an error)');
-              set({signInLoading: false, signInError: null});
+              console.log('[WinPrint][Auth]   → User cancelled account picker (not an error)');
+              set({ signInLoading: false, signInError: null });
               return;
             }
+            console.error('[WinPrint][Auth] STAGE 1 FAILED: Google Sign-In error, code:', ge?.code);
             throw googleErr;
           }
 
-          // ── STAGE 2: Firebase signInWithCredential ─────────────────────────
-          console.log('[WinPrint][SignIn] STAGE 2: Firebase signInWithCredential');
+          // ── STAGE 3: Firebase signInWithCredential ─────────────────────────
+          console.log('[WinPrint][Auth] STAGE 2: Firebase signInWithCredential');
           let uid: string;
           try {
             uid = await FirebaseAuthService.signInWithGoogleToken(result.idToken);
-            console.log('[WinPrint][SignIn] STAGE 2 OK: Firebase UID obtained');
-            console.log('[WinPrint][SignIn]   uid length:', uid?.length);
+            console.log('[WinPrint][Auth] STAGE 2 OK: Firebase UID obtained (length:', uid?.length, ')');
           } catch (firebaseErr: unknown) {
-            const fe = firebaseErr as {code?: string; message?: string; nativeErrorMessage?: string};
-            console.error('[WinPrint][SignIn] STAGE 2 FAILED: Firebase credential error');
-            console.error('[WinPrint][SignIn]   code:', fe?.code);
-            console.error('[WinPrint][SignIn]   message:', fe?.message);
-            console.error('[WinPrint][SignIn]   nativeErrorMessage:', fe?.nativeErrorMessage);
+            const fe = firebaseErr as { code?: string; message?: string };
+            console.error('[WinPrint][Auth] STAGE 2 FAILED: Firebase credential error, code:', fe?.code);
             throw firebaseErr;
           }
 
-          // ── STAGE 3: Firestore user profile ───────────────────────────────
-          console.log('[WinPrint][SignIn] STAGE 3: Fetching Firestore user profile');
+          // ── STAGE 4: Firestore user profile ───────────────────────────────
+          console.log('[WinPrint][Auth] STAGE 3: Fetching Firestore user profile');
           let authProfile: FirebaseAuthService.UserProfile | null;
           try {
             authProfile = await FirebaseAuthService.fetchUserProfile(uid, result.user.email, result.user.name ?? undefined);
-            console.log('[WinPrint][SignIn] STAGE 3 OK');
-            console.log('[WinPrint][SignIn]   status:', authProfile?.status);
-            console.log('[WinPrint][SignIn]   role:', authProfile?.role);
-            console.log('[WinPrint][SignIn]   businessId:', authProfile?.businessId ?? '(none)');
+            console.log('[WinPrint][Auth] STAGE 3 OK: status:', authProfile?.status, 'role:', authProfile?.role);
           } catch (profileErr: unknown) {
-            const pe = profileErr as {code?: string; message?: string};
-            console.error('[WinPrint][SignIn] STAGE 3 FAILED: Firestore profile fetch error');
-            console.error('[WinPrint][SignIn]   code:', pe?.code);
-            console.error('[WinPrint][SignIn]   message:', pe?.message);
+            const pe = profileErr as { code?: string; message?: string };
+            console.error('[WinPrint][Auth] STAGE 3 FAILED: Firestore profile fetch error, code:', pe?.code);
             throw profileErr;
           }
 
-          // ── STAGE 4: Customer lookup (conditional) ─────────────────────────
+          // ── STAGE 5: Customer lookup (conditional) ─────────────────────────
           let customer: FirebaseAuthService.Customer | null = null;
           if (authProfile?.status === 'active' && authProfile.businessId) {
-            console.log('[WinPrint][SignIn] STAGE 4: Fetching customer for businessId:', authProfile.businessId);
+            console.log('[WinPrint][Auth] STAGE 4: Fetching customer for businessId:', authProfile.businessId);
             try {
               customer = await FirebaseAuthService.fetchCustomer(authProfile.businessId);
-              console.log('[WinPrint][SignIn] STAGE 4 OK: customer.status:', customer?.status);
+              console.log('[WinPrint][Auth] STAGE 4 OK: customer.status:', customer?.status);
             } catch (customerErr: unknown) {
-              const ce = customerErr as {code?: string; message?: string};
-              console.error('[WinPrint][SignIn] STAGE 4 FAILED: Customer fetch error');
-              console.error('[WinPrint][SignIn]   code:', ce?.code);
-              console.error('[WinPrint][SignIn]   message:', ce?.message);
-              // Non-fatal — allow sign-in to complete, user will see businessPending or businessSuspended state
-              console.warn('[WinPrint][SignIn]   → Continuing with null customer');
+              const ce = customerErr as { code?: string; message?: string };
+              console.error('[WinPrint][Auth] STAGE 4 FAILED: Customer fetch error, code:', ce?.code);
+              // Non-fatal — allow sign-in to complete
+              console.warn('[WinPrint][Auth]   → Continuing with null customer');
             }
           } else {
-            console.log('[WinPrint][SignIn] STAGE 4: Skipped (status:', authProfile?.status, '/ businessId:', authProfile?.businessId ?? 'none)');
+            console.log('[WinPrint][Auth] STAGE 4: Skipped (status:', authProfile?.status, '/ businessId:', authProfile?.businessId ?? 'none)');
           }
 
-          console.log('[WinPrint][SignIn] SUCCESS: All stages complete');
+          console.log('[WinPrint][Auth] Sign-in SUCCESS: All stages complete');
           set({
             user: result.user,
             authProfile,
             customer,
-            accessToken: result.accessToken,
+            accessToken: null, // Not stored — Drive uses on-demand tokens from DriveClient
+            driveNeedsReauth: false,
+            driveAccessChecked: false,
             signInLoading: false,
             signInError: null,
           });
@@ -408,11 +442,8 @@ export const useAppStore = create<AppStore>()(
             void MonitoringService.ensureRegistered();
           }
         } catch (e: unknown) {
-          const err = e as {code?: string; message?: string; nativeErrorMessage?: string};
-          console.error('[WinPrint][SignIn] UNHANDLED ERROR in signIn()');
-          console.error('[WinPrint][SignIn]   code:', err?.code);
-          console.error('[WinPrint][SignIn]   message:', err?.message);
-          console.error('[WinPrint][SignIn]   nativeErrorMessage:', err?.nativeErrorMessage);
+          const err = e as { code?: string; message?: string; nativeErrorMessage?: string };
+          console.error('[WinPrint][Auth] UNHANDLED ERROR in signIn()', 'code:', err?.code, 'message:', err?.message);
           set({
             signInLoading: false,
             signInError: err?.message ?? 'Sign-in failed.',
@@ -423,16 +454,18 @@ export const useAppStore = create<AppStore>()(
       signOut: async () => {
         try {
           await FirebaseAuthService.signOutFirebase();
-          await GoogleAuthService.signOut();
         } catch {
-          // Best effort — clear state regardless
+          // Firebase logout failure must not prevent native Google logout.
         }
+        try { await GoogleAuthService.signOut(); } catch { /* best effort */ }
         MonitoringService.disconnect();
         set({
           user: null,
           authProfile: null,
           customer: null,
           accessToken: null,
+          driveNeedsReauth: false,
+          driveAccessChecked: false,
           // Note: Canonical folder preferences (sourceFolderId, archiveFolderId)
           // are preserved across sessions so re-signing in does not wipe them.
           folders: [],
@@ -448,23 +481,127 @@ export const useAppStore = create<AppStore>()(
       },
 
       restoreSession: async () => {
-        set({restoreSessionLoading: true, signInError: null});
+        console.log('[WinPrint][Auth] App startup: restoreSession()');
+        const previouslyAuthorizedUid = get().authProfile?.uid ?? null;
+        set({ restoreSessionLoading: true, signInError: null });
+
+        // Ensure Google Sign-In native module is configured BEFORE checking
+        // Firebase state, so tokens are available for Drive if needed.
+        GoogleAuthService.configure();
+        console.log('[WinPrint][Auth] Google Sign-In configured');
+
         try {
-          const result = await GoogleAuthService.getCurrentUser();
-          if (result) {
-            const uid = await FirebaseAuthService.signInWithGoogleToken(result.idToken);
-            const authProfile = await FirebaseAuthService.fetchUserProfile(uid, result.user.email, result.user.name ?? undefined);
+          // ── Step 1: Check Firebase Auth state (authoritative session source) ──
+          // Firebase Auth persists the session across app restarts.
+          // We do NOT rely on Google Sign-In state to determine if the user
+          // is logged into Firebase.
+          console.log('[WinPrint][Auth] Checking Firebase Auth current user...');
+          const firebaseUser = await FirebaseAuthService.waitForInitialAuthState();
+
+          if (firebaseUser) {
+            console.log('[WinPrint][Auth] Firebase user restored (uid length:', firebaseUser.uid?.length, ')');
+
+            // ── Step 2: Load Firestore profile ──────────────────────────────
+            console.log('[WinPrint][Auth] Fetching Firestore profile...');
+            const authProfile = await FirebaseAuthService.fetchUserProfile(
+              firebaseUser.uid,
+              firebaseUser.email ?? undefined,
+              firebaseUser.displayName ?? undefined,
+            );
+            console.log('[WinPrint][Auth] Profile: status:', authProfile?.status, 'role:', authProfile?.role);
+
+            // ── Step 3: Restore Google user info (for display purposes) ─────
+            // The Google Sign-In native layer may or may not have a cached user
+            // after a cold start. We get it synchronously if available; if not,
+            // we construct a GoogleUser from Firebase data. This does NOT affect
+            // Drive token availability — DriveClient gets tokens on-demand.
+            // Firebase identity is authoritative; native Google state is only
+            // needed later when a Drive operation obtains its OAuth token.
+            const googleUser: GoogleUser = {
+              id: firebaseUser.uid,
+              email: firebaseUser.email ?? '',
+              name: firebaseUser.displayName ?? null,
+              photo: firebaseUser.photoURL ?? null,
+            };
+
+            // ── Step 4: Customer lookup ──────────────────────────────────────
             let customer: FirebaseAuthService.Customer | null = null;
             if (authProfile?.status === 'active' && authProfile.businessId) {
-              customer = await FirebaseAuthService.fetchCustomer(authProfile.businessId);
+              try {
+                customer = await FirebaseAuthService.fetchCustomer(authProfile.businessId);
+                console.log('[WinPrint][Auth] Customer restored: status:', customer?.status);
+              } catch (ce) {
+                console.warn('[WinPrint][Auth] Customer fetch failed (non-fatal):', ce);
+              }
             }
-            set({user: result.user, authProfile, customer, accessToken: result.accessToken});
+
+            set({
+              user: googleUser,
+              authProfile,
+              customer,
+              accessToken: null, // Never stored; Drive uses on-demand tokens
+              driveNeedsReauth: previouslyAuthorizedUid && previouslyAuthorizedUid !== firebaseUser.uid
+                ? false
+                : get().driveNeedsReauth,
+              driveAccessChecked: previouslyAuthorizedUid && previouslyAuthorizedUid !== firebaseUser.uid
+                ? false
+                : get().driveAccessChecked,
+              signInError: null,
+            });
+            console.log('[WinPrint][Auth] Session restored successfully via Firebase Auth');
+
+          } else {
+            // Firebase has completed its initial restoration and confirmed
+            // there is no application session. A cached Google user alone
+            // must never authenticate the application.
+            console.log('[WinPrint][Auth] No Firebase session found');
+            set({ user: null, authProfile: null, customer: null, accessToken: null, driveNeedsReauth: false, driveAccessChecked: false });
           }
         } catch (e: unknown) {
-          const err = e as {message?: string};
+          const err = e as { message?: string };
+          console.error('[WinPrint][Auth] RESTORE FAILED:', err?.message);
           set({ signInError: err?.message ?? 'Failed to verify account.' });
         } finally {
-          set({restoreSessionLoading: false});
+          set({ restoreSessionLoading: false });
+          console.log('[WinPrint][Auth] restoreSession() complete');
+        }
+      },
+
+      reconnectGoogleDrive: async () => {
+        console.log('[WinPrint][Auth] reconnectGoogleDrive()');
+        set({ driveError: null });
+        try {
+          const firebaseEmail = get().user?.email?.toLowerCase();
+          let googleUser = GoogleAuthService.getCurrentUserSync();
+          if (firebaseEmail && googleUser && googleUser.email.toLowerCase() !== firebaseEmail) {
+            await GoogleAuthService.signOut();
+            googleUser = null;
+          }
+          let token = await GoogleAuthService.getValidDriveAccessToken();
+          googleUser = GoogleAuthService.getCurrentUserSync();
+          if (token && firebaseEmail && googleUser && googleUser.email.toLowerCase() !== firebaseEmail) {
+            await GoogleAuthService.signOut();
+            token = null;
+          }
+          if (!token) {
+            const result = await GoogleAuthService.signIn();
+            if (!result.idToken) throw new Error('Google Sign-In returned no ID token.');
+            if (firebaseEmail && result.user.email.toLowerCase() !== firebaseEmail) {
+              await GoogleAuthService.signOut();
+              throw new Error('Choose the Google account associated with your signed-in app account.');
+            }
+            token = await GoogleAuthService.getValidDriveAccessToken();
+          }
+          if (!token) throw new Error('Google Drive did not return an access token.');
+          set({ driveNeedsReauth: false });
+          await get().validateSavedFolders();
+        } catch (e: unknown) {
+          const err = e as { code?: string; message?: string };
+          set({
+            driveNeedsReauth: true,
+            driveError: 'Google Drive authorization needs attention.',
+          });
+          console.warn('[WinPrint][Auth] reconnectGoogleDrive failed:', err?.code, err?.message);
         }
       },
 
@@ -482,24 +619,32 @@ export const useAppStore = create<AppStore>()(
       foldersLoading: false,
       csvLoading: false,
       driveError: null,
+      driveNeedsReauth: false,
+      driveAccessChecked: false,
 
       // ── Drive actions ───────────────────────────────────────────────────────
 
       loadFolders: async (parentId = 'root') => {
-        const {accessToken} = get();
-        if (!accessToken) {
-          set({driveError: 'Not signed in.'});
+        // No accessToken check needed — DriveClient fetches token on-demand.
+        // We still require user to be signed in.
+        if (!get().user) {
+          set({ driveError: 'Not signed in.' });
           return;
         }
-        set({foldersLoading: true, driveError: null});
+        set({ foldersLoading: true, driveError: null, driveNeedsReauth: false });
         try {
-          const folders = await DriveService.listFolders(accessToken, parentId);
-          set({folders, foldersLoading: false});
+          const folders = await DriveService.listFolders(parentId);
+          set({ folders, foldersLoading: false, driveAccessChecked: true, driveNeedsReauth: false });
         } catch (e: unknown) {
-          const err = e as {message?: string};
+          const isDriveAuthError = e instanceof DriveAuthError;
+          const err = e as { message?: string };
           set({
             foldersLoading: false,
-            driveError: err?.message ?? 'Failed to load folders.',
+            driveError: isDriveAuthError
+              ? 'Google Drive authorization needs attention.'
+              : (err?.message ?? 'Failed to load folders.'),
+            driveNeedsReauth: isDriveAuthError,
+            driveAccessChecked: isDriveAuthError ? true : get().driveAccessChecked,
           });
         }
       },
@@ -516,6 +661,7 @@ export const useAppStore = create<AppStore>()(
           lastParsedFileId: null,
           csvError: null,
           driveError: null,
+          driveNeedsReauth: false,
           generatedPdfPaths: {},
           generatingReceiptIndex: null,
           pdfError: null,
@@ -540,25 +686,32 @@ export const useAppStore = create<AppStore>()(
       },
 
       validateSavedFolders: async () => {
-        const {accessToken, sourceFolderId, archiveFolderId, sourceFolderName, archiveFolderName} = get();
-        if (!accessToken) return;
+        const { sourceFolderId, archiveFolderId, sourceFolderName, archiveFolderName, user } = get();
+        // Only validate if user is authenticated (Drive token available on-demand)
+        if (!user) return;
 
         if (sourceFolderId) {
           try {
-            const meta = await DriveService.getFileMetadata(accessToken, sourceFolderId);
+            const meta = await DriveService.getFileMetadata(sourceFolderId);
             if (meta && meta.mimeType === 'application/vnd.google-apps.folder' && !meta.trashed) {
               if (meta.name && meta.name !== sourceFolderName) {
-                set({sourceFolderName: meta.name});
+                set({ sourceFolderName: meta.name });
               }
-              set({sourceFolderValid: true});
+              set({ sourceFolderValid: true, driveAccessChecked: true, driveNeedsReauth: false });
             } else {
               set({
                 sourceFolderValid: false,
                 driveError: 'The selected source folder no longer exists or was moved to trash.',
               });
             }
-          } catch (e: any) {
-            const status = e?.status ?? e?.statusCode;
+          } catch (e: unknown) {
+            if (e instanceof DriveAuthError) {
+              // Don't mark folder invalid on auth error — token will refresh
+              set({ driveNeedsReauth: true, driveAccessChecked: true });
+              return;
+            }
+            const err = e as { status?: number; statusCode?: number };
+            const status = err?.status ?? err?.statusCode;
             if (status === 404 || status === 403) {
               set({
                 sourceFolderValid: false,
@@ -566,43 +719,57 @@ export const useAppStore = create<AppStore>()(
               });
             } else {
               // Network/temporary error — keep valid
-              set({sourceFolderValid: true});
+              set({ sourceFolderValid: true });
             }
           }
         }
 
         if (archiveFolderId) {
           try {
-            const meta = await DriveService.getFileMetadata(accessToken, archiveFolderId);
+            const meta = await DriveService.getFileMetadata(archiveFolderId);
             if (meta && meta.mimeType === 'application/vnd.google-apps.folder' && !meta.trashed) {
               if (meta.name && meta.name !== archiveFolderName) {
-                set({archiveFolderName: meta.name});
+                set({ archiveFolderName: meta.name });
               }
-              set({archiveFolderValid: true});
+              set({ archiveFolderValid: true, driveAccessChecked: true, driveNeedsReauth: false });
             } else {
-              set({archiveFolderValid: false});
+              set({ archiveFolderValid: false });
             }
-          } catch {
-            set({archiveFolderValid: true});
+          } catch (e: unknown) {
+            if (e instanceof DriveAuthError) {
+              set({ driveNeedsReauth: true, driveAccessChecked: true });
+              return;
+            }
+            // Temporary network failures do not invalidate a saved folder.
+            set({ archiveFolderValid: true });
           }
         }
       },
 
       loadCsvFiles: async () => {
-        const {accessToken, sourceFolderId} = get();
-        if (!accessToken || !sourceFolderId) {
-          set({driveError: 'No folder selected.'});
+        const { sourceFolderId, user } = get();
+        if (!user) {
+          set({ driveError: 'Not signed in.' });
           return;
         }
-        set({csvLoading: true, driveError: null});
+        if (!sourceFolderId) {
+          set({ driveError: 'No folder selected.' });
+          return;
+        }
+        set({ csvLoading: true, driveError: null, driveNeedsReauth: false });
         try {
-          const csvFiles = await DriveService.listCsvFiles(accessToken, sourceFolderId);
-          set({csvFiles, csvLoading: false});
+          const csvFiles = await DriveService.listCsvFiles(sourceFolderId);
+          set({ csvFiles, csvLoading: false, driveAccessChecked: true, driveNeedsReauth: false });
         } catch (e: unknown) {
-          const err = e as {message?: string};
+          const isDriveAuthError = e instanceof DriveAuthError;
+          const err = e as { message?: string };
           set({
             csvLoading: false,
-            driveError: err?.message ?? 'Failed to list CSV files.',
+            driveError: isDriveAuthError
+              ? 'Google Drive authorization needs attention.'
+              : (err?.message ?? 'Failed to list CSV files.'),
+            driveNeedsReauth: isDriveAuthError,
+            driveAccessChecked: isDriveAuthError ? true : get().driveAccessChecked,
           });
         }
       },
@@ -616,43 +783,37 @@ export const useAppStore = create<AppStore>()(
       // ── CSV actions ─────────────────────────────────────────────────────────
 
       downloadAndParse: async (file: DriveFile) => {
-        const {accessToken, sourceFolderId} = get();
-        if (!accessToken) {
-          set({csvError: 'Not signed in.'});
+        const { sourceFolderId, user } = get();
+        if (!user) {
+          set({ csvError: 'Not signed in.' });
           return;
         }
-        set({parseLoading: true, csvError: null});
+        set({ parseLoading: true, csvError: null, driveNeedsReauth: false });
         try {
-          const result = await DriveService.downloadAndParseCsv(accessToken, file);
+          const result = await DriveService.downloadAndParseCsv(file);
+          // Populate durable archive accounting as soon as the complete CSV is parsed.
+          get().prepareCsvForQueue(file.id, sourceFolderId || 'root', result.receipts.length);
           set((state) => {
-            const currentProgress = state.csvProgress[file.id];
-            let newProgress = currentProgress;
-            if (!currentProgress) {
-              newProgress = {
-                driveFileId: file.id,
-                sourceFolderId: sourceFolderId || 'root',
-                expectedCount: result.receipts.length,
-                printedCount: 0,
-                archiveStatus: 'PENDING',
-              };
-            }
             return {
               receipts: result.receipts,
               parseLoading: false,
               lastParsedFileId: file.id,
+              driveAccessChecked: true,
+              driveNeedsReauth: false,
               generatedPdfPaths: {},
               pdfError: null,
-              csvProgress: {
-                ...state.csvProgress,
-                [file.id]: newProgress,
-              },
             };
           });
         } catch (e: unknown) {
-          const err = e as {message?: string};
+          const isDriveAuthError = e instanceof DriveAuthError;
+          const err = e as { message?: string };
           set({
             parseLoading: false,
-            csvError: err?.message ?? 'Failed to parse CSV.',
+            csvError: isDriveAuthError
+              ? 'Google Drive authorization needs attention.'
+              : (err?.message ?? 'Failed to parse CSV.'),
+            driveNeedsReauth: isDriveAuthError,
+            driveAccessChecked: isDriveAuthError ? true : get().driveAccessChecked,
           });
         }
       },
@@ -678,17 +839,17 @@ export const useAppStore = create<AppStore>()(
       generateReceiptPdf: async (receiptIndex: number) => {
         const receipt = get().receipts[receiptIndex];
         if (!receipt) {
-          set({pdfError: 'The selected parsed transaction is no longer available.'});
+          set({ pdfError: 'The selected parsed transaction is no longer available.' });
           return null;
         }
 
-        set({generatingReceiptIndex: receiptIndex, pdfError: null});
+        set({ generatingReceiptIndex: receiptIndex, pdfError: null });
         try {
-          const {businessProfile, a4Template} = get();
+          const { businessProfile, a4Template } = get();
           const path = await ReceiptPdfService.generateReceiptPdf(receipt, businessProfile, a4Template);
           const key = receiptIdentity(receipt);
           set(state => ({
-            generatedPdfPaths: {...state.generatedPdfPaths, [key]: path},
+            generatedPdfPaths: { ...state.generatedPdfPaths, [key]: path },
             generatingReceiptIndex: null,
           }));
           return path;
@@ -702,7 +863,7 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      clearPdfError: () => set({pdfError: null}),
+      clearPdfError: () => set({ pdfError: null }),
 
       // ── Printer initial state ───────────────────────────────────────────────
       selectedPrinterType: 'office',
@@ -716,42 +877,42 @@ export const useAppStore = create<AppStore>()(
       // ── Printer actions ─────────────────────────────────────────────────────
 
       setPrinterType: (type: PrinterType) => {
-        set({selectedPrinterType: type, printerError: null, lastPrintResult: null});
+        set({ selectedPrinterType: type, printerError: null, lastPrintResult: null });
       },
 
       setSelectedBluetoothDevice: (device: BluetoothDevice | null) => {
-        set({selectedBluetoothDevice: device, printerError: null});
+        set({ selectedBluetoothDevice: device, printerError: null });
       },
 
       loadPairedDevices: async () => {
-        set({devicesLoading: true, printerError: null});
+        set({ devicesLoading: true, printerError: null });
         try {
           const thermalAdapter = PrinterService.getThermalAdapter();
           const devices = await thermalAdapter.getBondedDevices();
-          set({pairedDevices: devices, devicesLoading: false});
+          set({ pairedDevices: devices, devicesLoading: false });
         } catch (e: unknown) {
           const message = e instanceof Error ? e.message : String(e);
-          set({devicesLoading: false, printerError: message || 'Failed to load paired Bluetooth devices.'});
+          set({ devicesLoading: false, printerError: message || 'Failed to load paired Bluetooth devices.' });
         }
       },
 
       connectBluetoothPrinter: async (device: BluetoothDevice) => {
-        set({printLoading: true, printerError: null});
+        set({ printLoading: true, printerError: null });
         try {
           const thermalAdapter = PrinterService.getThermalAdapter();
           await thermalAdapter.connect(device.address);
-          set({selectedBluetoothDevice: device, printLoading: false});
+          set({ selectedBluetoothDevice: device, printLoading: false });
           return true;
         } catch (e: unknown) {
           const message = e instanceof Error ? e.message : String(e);
-          set({printLoading: false, printerError: message || 'Failed to connect to Bluetooth printer.'});
+          set({ printLoading: false, printerError: message || 'Failed to connect to Bluetooth printer.' });
           return false;
         }
       },
 
       printReceipt: async (receipt: Receipt) => {
-        const {selectedPrinterType, selectedBluetoothDevice, businessProfile, a4Template, thermalTemplate} = get();
-        set({printLoading: true, printerError: null});
+        const { selectedPrinterType, selectedBluetoothDevice, businessProfile, a4Template, thermalTemplate } = get();
+        set({ printLoading: true, printerError: null });
         try {
           const adapter = PrinterService.getAdapter(selectedPrinterType);
           if (selectedPrinterType === 'thermal' && selectedBluetoothDevice) {
@@ -771,7 +932,7 @@ export const useAppStore = create<AppStore>()(
           return result;
         } catch (e: unknown) {
           const message = e instanceof Error ? e.message : String(e);
-          const failResult = {success: false, error: message};
+          const failResult = { success: false, error: message };
           set({
             printLoading: false,
             lastPrintResult: failResult,
@@ -782,8 +943,8 @@ export const useAppStore = create<AppStore>()(
       },
 
       testPrintCurrentPrinter: async () => {
-        const {selectedPrinterType, selectedBluetoothDevice} = get();
-        set({printLoading: true, printerError: null});
+        const { selectedPrinterType, selectedBluetoothDevice } = get();
+        set({ printLoading: true, printerError: null });
         try {
           const adapter = PrinterService.getAdapter(selectedPrinterType);
           if (selectedPrinterType === 'thermal' && selectedBluetoothDevice) {
@@ -802,7 +963,7 @@ export const useAppStore = create<AppStore>()(
           return result;
         } catch (e: unknown) {
           const message = e instanceof Error ? e.message : String(e);
-          const failResult = {success: false, error: message};
+          const failResult = { success: false, error: message };
           set({
             printLoading: false,
             lastPrintResult: failResult,
@@ -812,11 +973,12 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      clearPrinterError: () => set({printerError: null}),
+      clearPrinterError: () => set({ printerError: null }),
 
       // ── Queue & Archive initial state ───────────────────────────────────────
       queue: [],
       csvProgress: {},
+      reprintHistory: [],
 
       // ── Queue & Archive actions ─────────────────────────────────────────────
 
@@ -827,7 +989,7 @@ export const useAppStore = create<AppStore>()(
         if (existing && (existing.status === 'QUEUED' || existing.status === 'PRINTING' || existing.status === 'PRINTED')) {
           return; // Duplicate protection
         }
-        
+
         const newItem: QueueItem = {
           identity,
           status: 'QUEUED',
@@ -843,23 +1005,55 @@ export const useAppStore = create<AppStore>()(
         set({ queue: newQueue });
       },
 
+      prepareCsvForQueue: (driveFileId: string, sourceFolderId: string, expectedCount: number) => {
+        if (!driveFileId || !sourceFolderId || !Number.isFinite(expectedCount) || expectedCount <= 0) return;
+        const state = get();
+        const existing = state.csvProgress[driveFileId];
+        const printedInQueue = state.queue.filter(
+          item => item.receipt.sourceFile?.driveFileId === driveFileId && item.status === 'PRINTED',
+        ).length;
+        const printedCount = Math.max(existing?.printedCount ?? 0, printedInQueue);
+        const archiveStatus = existing?.archiveStatus ?? 'PENDING';
+
+        set(current => ({
+          csvProgress: {
+            ...current.csvProgress,
+            [driveFileId]: {
+              ...existing,
+              driveFileId,
+              sourceFolderId,
+              expectedCount,
+              printedCount,
+              archiveStatus,
+            },
+          },
+        }));
+
+        // A duplicate discovery can reconstruct progress after receipts were
+        // already printed. Archive that file without enqueueing or printing it again.
+        if (printedCount >= expectedCount && (archiveStatus === 'PENDING' || archiveStatus === 'ARCHIVING')) {
+          void get().retryArchive(driveFileId);
+        }
+      },
+
       updateQueueItemStatus: async (identity: string, status: PrintStatus, error?: string) => {
-        const { queue, csvProgress, accessToken, archiveFolderId } = get();
+        const { queue, csvProgress } = get();
         const itemIndex = queue.findIndex(q => q.identity === identity);
         if (itemIndex === -1) return;
 
         const item = queue[itemIndex];
-        const updatedItem = { 
-          ...item, 
-          status, 
-          error, 
-          completedAt: (status === 'PRINTED' || status === 'FAILED') ? Date.now() : item.completedAt 
+        const updatedItem = {
+          ...item,
+          status,
+          error,
+          completedAt: (status === 'PRINTED' || status === 'FAILED') ? Date.now() : item.completedAt
         };
-        
+
         let newQueue = [...queue];
         newQueue[itemIndex] = updatedItem;
 
-        let newCsvProgress = { ...csvProgress };
+        const newCsvProgress = { ...csvProgress };
+        let archiveFileId: string | null = null;
 
         if (status === 'PRINTED' && item.status !== 'PRINTED') {
           const driveFileId = item.receipt.sourceFile?.driveFileId;
@@ -873,77 +1067,98 @@ export const useAppStore = create<AppStore>()(
               };
 
               if (newPrintedCount >= prog.expectedCount && prog.archiveStatus === 'PENDING') {
-                if (accessToken && archiveFolderId) {
-                  try {
-                    await DriveService.moveFile(accessToken, driveFileId, prog.sourceFolderId, archiveFolderId);
-                    newCsvProgress[driveFileId].archiveStatus = 'ARCHIVED';
-                  } catch (e: unknown) {
-                    const msg = e instanceof Error ? e.message : String(e);
-                    newCsvProgress[driveFileId].archiveStatus = 'FAILED';
-                    newCsvProgress[driveFileId].archiveError = msg;
-                  }
-                } else {
-                   newCsvProgress[driveFileId].archiveStatus = 'FAILED';
-                   newCsvProgress[driveFileId].archiveError = 'Archive skipped: Not signed in or no archive folder selected.';
-                }
+                // Persist successful print accounting before performing the
+                // network move, so an app restart can safely resume archiving.
+                newCsvProgress[driveFileId].archiveStatus = 'ARCHIVING';
+                archiveFileId = driveFileId;
               }
             }
           }
         }
 
         set({ queue: newQueue, csvProgress: newCsvProgress });
+        if (archiveFileId) await get().retryArchive(archiveFileId);
       },
 
       retryFailedPrints: () => {
-         const { queue } = get();
-         const newQueue = queue.map(q => q.status === 'FAILED' ? { ...q, status: 'QUEUED' as PrintStatus, error: undefined } : q);
-         set({ queue: newQueue });
+        const { queue } = get();
+        const newQueue = queue.map(q => q.status === 'FAILED' ? { ...q, status: 'QUEUED' as PrintStatus, error: undefined } : q);
+        set({ queue: newQueue });
       },
 
       retryArchive: async (driveFileId: string) => {
-         const { csvProgress, accessToken, archiveFolderId } = get();
-         const prog = csvProgress[driveFileId];
-         if (!prog || prog.archiveStatus !== 'FAILED') return;
+        const { csvProgress, archiveFolderId, user } = get();
+        const prog = csvProgress[driveFileId];
+        if (!prog || prog.archiveStatus === 'ARCHIVED' || prog.printedCount < prog.expectedCount) return;
+        if (prog.archiveStatus !== 'FAILED' && prog.archiveStatus !== 'ARCHIVING' && prog.archiveStatus !== 'PENDING') return;
+        if (archiveMovesInFlight.has(driveFileId)) return;
 
-         if (!accessToken || !archiveFolderId) {
-            set({
-               csvProgress: {
-                 ...csvProgress,
-                 [driveFileId]: { ...prog, archiveError: 'Not signed in or no archive folder selected.' }
-               }
-            });
-            return;
-         }
-
-         // Mark as pending while retrying
-         set({
+        if (!user || !archiveFolderId) {
+          set({
             csvProgress: {
-               ...csvProgress,
-               [driveFileId]: { ...prog, archiveStatus: 'PENDING', archiveError: undefined }
+              ...csvProgress,
+              [driveFileId]: {
+                ...prog,
+                archiveStatus: 'FAILED',
+                archiveError: !user
+                  ? 'Sign in again to archive this printed CSV.'
+                  : 'Select a Printed/archive folder in Drive settings, then retry the archive.',
+              }
             }
-         });
+          });
+          return;
+        }
 
-         try {
-            await DriveService.moveFile(accessToken, driveFileId, prog.sourceFolderId, archiveFolderId);
-            set(state => ({
-               csvProgress: {
-                 ...state.csvProgress,
-                 [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'ARCHIVED', archiveError: undefined }
-               }
-            }));
-         } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            set(state => ({
-               csvProgress: {
-                 ...state.csvProgress,
-                 [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'FAILED', archiveError: msg }
-               }
-            }));
-         }
+        archiveMovesInFlight.add(driveFileId);
+        set({
+          csvProgress: {
+            ...csvProgress,
+            [driveFileId]: { ...prog, archiveStatus: 'ARCHIVING', archiveError: undefined }
+          }
+        });
+
+        try {
+          await DriveService.moveFile(driveFileId, prog.sourceFolderId, archiveFolderId);
+          set(state => ({
+            driveAccessChecked: true,
+            driveNeedsReauth: false,
+            csvProgress: {
+              ...state.csvProgress,
+              [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'ARCHIVED', archiveError: undefined }
+            }
+          }));
+        } catch (e: unknown) {
+          const isDriveAuthError = e instanceof DriveAuthError;
+          const msg = isDriveAuthError
+            ? 'Archive failed: Google Drive authorization needs attention.'
+            : (e instanceof Error ? e.message : String(e));
+          set(state => ({
+            csvProgress: {
+              ...state.csvProgress,
+              [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'FAILED', archiveError: msg }
+            },
+            driveNeedsReauth: isDriveAuthError ? true : state.driveNeedsReauth,
+            driveAccessChecked: isDriveAuthError ? true : state.driveAccessChecked,
+          }));
+        } finally {
+          archiveMovesInFlight.delete(driveFileId);
+        }
+      },
+
+      resumePendingArchives: async () => {
+        const state = get();
+        if (!state.user) return;
+        const pending = Object.values(state.csvProgress).filter(progress =>
+          progress.printedCount >= progress.expectedCount &&
+          (progress.archiveStatus === 'ARCHIVING' || progress.archiveStatus === 'PENDING'),
+        );
+        for (const progress of pending) {
+          await get().retryArchive(progress.driveFileId);
+        }
       },
 
       clearHistory: () => {
-         set({ queue: [], csvProgress: {} });
+        set({ queue: [], csvProgress: {}, reprintHistory: [] });
       },
 
       processQueue: async () => {
@@ -961,6 +1176,36 @@ export const useAppStore = create<AppStore>()(
           } else {
             await updateQueueItemStatus(nextItem.identity, 'FAILED', result.error);
           }
+        }
+      },
+
+      reprintReceipt: async (identity: string) => {
+        const item = get().queue.find(entry => entry.identity === identity && entry.status === 'PRINTED');
+        if (!item) return { success: false, error: 'This printed receipt is no longer available in history.' };
+        if (reprintsInFlight.has(identity)) return { success: false, error: 'This receipt is already being reprinted.' };
+        if (reprintsInFlight.size > 0 || get().printLoading || get().queue.some(entry => entry.status === 'PRINTING')) {
+          return { success: false, error: 'The selected printer is busy. Try again when the current print finishes.' };
+        }
+        const receipt = item.receipt;
+        if (!receipt.transactionNumber || !receipt.items?.length || !receipt.sourceRows?.length) {
+          return { success: false, error: 'Saved receipt data is incomplete. Reprocess the original CSV before reprinting.' };
+        }
+        reprintsInFlight.add(identity);
+        try {
+          // Reprint uses the saved receipt directly. It does not enqueue a new
+          // business transaction or change original print/archive accounting.
+          const result = await get().printReceipt(receipt);
+          set(state => ({
+            reprintHistory: [...state.reprintHistory, {
+              identity,
+              attemptedAt: Date.now(),
+              success: result.success,
+              ...(result.error ? { error: result.error } : {}),
+            }].slice(-500),
+          }));
+          return result;
+        } finally {
+          reprintsInFlight.delete(identity);
         }
       },
 
@@ -1026,9 +1271,9 @@ export const useAppStore = create<AppStore>()(
         }),
 
       enqueueDeferredFile: async (entry: string): Promise<boolean> => {
-        const { accessToken, sourceFolderId, enqueueReceipt, removeDeferredFileId } = get();
-        if (!accessToken) {
-          set({ deferredError: 'Cannot enqueue deferred file: Not signed in to Google Drive.' });
+        const { sourceFolderId, enqueueReceipt, removeDeferredFileId, user } = get();
+        if (!user) {
+          set({ deferredError: 'Cannot enqueue deferred file: Not signed in.' });
           return false;
         }
 
@@ -1042,19 +1287,20 @@ export const useAppStore = create<AppStore>()(
           return false;
         }
 
-        set({ deferredLoadingId: entry, deferredError: null });
+        set({ deferredLoadingId: entry, deferredError: null, driveNeedsReauth: false });
         try {
           // Direct file metadata lookup using fileId
+          // Drive token obtained on-demand inside DriveClient
           let targetFile: DriveFile | undefined;
           try {
-            targetFile = await DriveService.getFileMetadata(accessToken, fileId);
+            targetFile = await DriveService.getFileMetadata(fileId);
           } catch (_) {
             // direct metadata fetch failed, try listing folder
           }
 
           if (!targetFile && folderId) {
             try {
-              const csvFiles = await DriveService.listCsvFiles(accessToken, folderId);
+              const csvFiles = await DriveService.listCsvFiles(folderId);
               targetFile = csvFiles.find(f => f.id === fileId);
             } catch (_) {
               // listing folder failed
@@ -1070,46 +1316,33 @@ export const useAppStore = create<AppStore>()(
           }
 
           // Download and parse CSV using existing Drive service pipeline
-          const { receipts } = await DriveService.downloadAndParseCsv(accessToken, targetFile);
+          const { receipts } = await DriveService.downloadAndParseCsv(targetFile);
 
           if (!receipts || receipts.length === 0) {
             throw new Error('The CSV contains no valid receipts.');
           }
 
           // Enqueue receipts using existing duplicate-protection logic
+          get().prepareCsvForQueue(fileId, folderId, receipts.length);
           for (const receipt of receipts) {
             enqueueReceipt(receipt);
           }
 
-          // Update csvProgress for auto-archive tracking
-          set(state => {
-            const currentProg = state.csvProgress[fileId];
-            if (!currentProg) {
-              return {
-                csvProgress: {
-                  ...state.csvProgress,
-                  [fileId]: {
-                    driveFileId: fileId,
-                    sourceFolderId: folderId,
-                    expectedCount: receipts.length,
-                    printedCount: 0,
-                    archiveStatus: 'PENDING',
-                  },
-                },
-              };
-            }
-            return {};
-          });
-
           // Successfully enqueued — remove from deferred list
+          set({ driveAccessChecked: true, driveNeedsReauth: false });
           removeDeferredFileId(entry);
           set({ deferredLoadingId: null, deferredError: null });
           return true;
         } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
+          const isDriveAuthError = e instanceof DriveAuthError;
+          const msg = isDriveAuthError
+            ? 'Google Drive authorization needs attention.'
+            : (e instanceof Error ? e.message : String(e));
           set({
             deferredLoadingId: null,
             deferredError: `Failed to enqueue "${fileName || fileId}": ${msg}`,
+            driveNeedsReauth: isDriveAuthError,
+            driveAccessChecked: isDriveAuthError ? true : get().driveAccessChecked,
           });
           return false;
         }
@@ -1141,6 +1374,7 @@ export const useAppStore = create<AppStore>()(
         // Queue and processing
         queue: state.queue,
         csvProgress: state.csvProgress,
+        reprintHistory: state.reprintHistory,
 
         // Monitoring state persisted across restarts
         monitoringEnabled: state.monitoringEnabled,

@@ -49,19 +49,18 @@ describe('DriveFolderPickerModal', () => {
         <DriveFolderPickerModal
           visible={true}
           title="Select Source Folder"
-          accessToken="test-token"
           onSelect={onSelect}
           onClose={onClose}
         />
       );
     });
 
-    expect(DriveService.listFolders).toHaveBeenCalledWith('test-token', 'root');
+    expect(DriveService.listFolders).toHaveBeenCalledWith('root');
     expect(tree).toBeDefined();
   });
 
   test('2. Navigates into nested folder and selects it', async () => {
-    (DriveService.listFolders as jest.Mock).mockImplementation((_token, parentId) => {
+    (DriveService.listFolders as jest.Mock).mockImplementation((parentId) => {
       if (parentId === 'root') {
         return Promise.resolve([
           {id: 'folder-winsoft', name: 'Winsoft Receipts', mimeType: 'application/vnd.google-apps.folder'},
@@ -84,7 +83,6 @@ describe('DriveFolderPickerModal', () => {
         <DriveFolderPickerModal
           visible={true}
           title="Select Incoming Folder"
-          accessToken="test-token"
           onSelect={onSelect}
           onClose={onClose}
         />
@@ -120,7 +118,7 @@ describe('DriveFolderPickerModal', () => {
       });
     }
 
-    expect(DriveService.listFolders).toHaveBeenCalledWith('test-token', 'folder-winsoft');
+    expect(DriveService.listFolders).toHaveBeenCalledWith('folder-winsoft');
 
     // Now FlatList data has updated to nested folder
     expect(flatList.props.data).toHaveLength(1);
@@ -150,7 +148,7 @@ describe('DriveFolderPickerModal', () => {
   });
 
   test('3. Back button navigates up to parent folder', async () => {
-    (DriveService.listFolders as jest.Mock).mockImplementation((_token, parentId) => {
+    (DriveService.listFolders as jest.Mock).mockImplementation((parentId) => {
       if (parentId === 'root') {
         return Promise.resolve([
           {id: 'folder-winsoft', name: 'Winsoft Receipts', mimeType: 'application/vnd.google-apps.folder'},
@@ -173,7 +171,6 @@ describe('DriveFolderPickerModal', () => {
         <DriveFolderPickerModal
           visible={true}
           title="Select Incoming Folder"
-          accessToken="test-token"
           onSelect={onSelect}
           onClose={onClose}
         />
@@ -204,7 +201,7 @@ describe('DriveFolderPickerModal', () => {
       });
     }
 
-    expect(DriveService.listFolders).toHaveBeenCalledWith('test-token', 'folder-winsoft');
+    expect(DriveService.listFolders).toHaveBeenCalledWith('folder-winsoft');
 
     // Now back button should exist
     const touchablesAfter = tree.root.findAll((node: any) => typeof node.props.onPress === 'function');
@@ -223,6 +220,6 @@ describe('DriveFolderPickerModal', () => {
     }
 
     // Should have re-fetched root
-    expect(DriveService.listFolders).toHaveBeenCalledWith('test-token', 'root');
+    expect(DriveService.listFolders).toHaveBeenCalledWith('root');
   });
 });

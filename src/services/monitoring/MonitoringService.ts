@@ -19,6 +19,7 @@
 import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
 import type { EmitterSubscription } from 'react-native';
 import * as DriveService from '../drive/DriveService';
+import { DriveAuthError } from '../drive/DriveClient';
 
 // ---------------------------------------------------------------------------
 // Native module bridge
@@ -48,12 +49,15 @@ export interface PrintIntentData {
   fileName: string;
 }
 
+function deferredEntryForIntent(intent: PrintIntentData): string {
+  return `${intent.fileId}::${intent.folderId}::${intent.fileName}`;
+}
+
 // ---------------------------------------------------------------------------
 // Store accessor (set during initialize to avoid a circular import)
 // ---------------------------------------------------------------------------
 
 export interface StoreAccessor {
-  getAccessToken: () => string | null;
   getSourceFolderId: () => string | null;
   getSourceFolderName?: () => string | null;
   getFcmRegistrationStatus: () => FcmStatus;
@@ -62,6 +66,8 @@ export interface StoreAccessor {
   getUserEmail?: () => string | null;
   getBusinessId?: () => string | null;
   enqueueReceipt: (receipt: import('../../models/Receipt').Receipt) => void;
+  prepareCsvForQueue: (driveFileId: string, sourceFolderId: string, expectedCount: number) => void;
+  isCsvKnown?: (driveFileId: string) => boolean;
   processQueue: () => Promise<void>;
   setFcmToken: (token: string) => void;
   setFcmRegistrationStatus: (s: FcmStatus) => void;
@@ -69,9 +75,11 @@ export interface StoreAccessor {
   recordDriveNotification: () => void;
   recordReconciliation: () => void;
   setMonitoringError: (msg: string | null) => void;
+  setDriveNeedsReauth?: (needsReauth: boolean) => void;
   addDeferredFileId: (entry: string) => void;
   removeDeferredFileId: (entry: string) => void;
   getDeferredFileIds: () => string[];
+  setDriveAccessAvailable?: () => void;
 }
 
 export type FcmStatus = 'unregistered' | 'registering' | 'registered' | 'error';
@@ -81,6 +89,7 @@ let eventEmitter: NativeEventEmitter | null = null;
 const subscriptions: EmitterSubscription[] = [];
 let backendUrl = '';
 let _initialized = false;
+let reconciliationInFlight = false;
 
 // ---------------------------------------------------------------------------
 // Initialisation
@@ -105,20 +114,7 @@ export async function initialize(
     return;
   }
 
-  // Subscribe to native events.
-  if (subscriptions.length === 0) {
-    eventEmitter = new NativeEventEmitter(native as never);
-     
-    const on = (event: string, handler: (data: any) => void) =>
-      eventEmitter!.addListener(event, handler);
-    subscriptions.push(
-      on('onFcmTokenRefresh', onFcmTokenRefresh),
-      on('onPrintActionReceived', onPrintActionReceived),
-      on('onLaterActionReceived', onLaterActionReceived),
-      on('onReconciliationRequested', onReconciliationRequested),
-      on('onDeferredFilesReady', onDeferredFilesReady),
-    );
-  }
+  attachNativeListeners(native);
 
   // Check if the app was cold-started via a PRINT intent.
   try {
@@ -137,7 +133,7 @@ export async function initialize(
       store.setFcmToken(token);
       const folderId = store.getSourceFolderId();
       if (folderId) {
-        await registerDevice(token, folderId, false).catch(() => {});
+        await registerDevice(token, folderId, false).catch(() => { });
       }
     }
   } catch (e) {
@@ -153,6 +149,19 @@ export async function initialize(
 
   // Check for deferred files from previous LATER taps.
   await processDeferredNativeFiles();
+}
+
+function attachNativeListeners(native: NonNullable<typeof WinsoftMonitoring>): void {
+  if (subscriptions.length > 0) return;
+  eventEmitter = new NativeEventEmitter(native as never);
+  const on = (event: string, handler: (data: any) => void) => eventEmitter!.addListener(event, handler);
+  subscriptions.push(
+    on('onFcmTokenRefresh', onFcmTokenRefresh),
+    on('onPrintActionReceived', onPrintActionReceived),
+    on('onLaterActionReceived', onLaterActionReceived),
+    on('onReconciliationRequested', onReconciliationRequested),
+    on('onDeferredFilesReady', onDeferredFilesReady),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +195,7 @@ export async function registerDevice(
   if (native && typeof native.getDeviceId === 'function') {
     try {
       deviceId = await native.getDeviceId();
-    } catch (_) {}
+    } catch (_) { }
   }
 
   const tokenSuffix = fcmToken.length > 6 ? `...${fcmToken.slice(-6)}` : fcmToken;
@@ -232,7 +241,7 @@ export async function registerDevice(
           } else {
             errMsg = parsed.message || parsed.error || errMsg;
           }
-        } catch (_) {}
+        } catch (_) { }
       } else {
         const safeBody = rawBody.slice(0, 200).replace(/\n/g, ' ');
         errMsg = `HTTP ${resp.status}: ${safeBody}`;
@@ -310,7 +319,7 @@ export async function updateMonitoredFolder(folderId: string): Promise<void> {
   if (!store || !_initialized) return;
   const token = store.getCachedFcmToken();
   if (token && backendUrl) {
-    await registerDevice(token, folderId, true).catch(() => {});
+    await registerDevice(token, folderId, true).catch(() => { });
   }
 }
 
@@ -341,13 +350,13 @@ export async function reconnect(): Promise<void> {
   let perm: string = 'granted';
   try {
     perm = await native.getNotificationPermissionStatus();
-  } catch (_) {}
+  } catch (_) { }
 
   if (perm === 'denied') {
     let requested = 'denied';
     try {
       requested = await native.requestNotificationPermission();
-    } catch (_) {}
+    } catch (_) { }
     if (requested === 'denied') {
       const err = 'Notification permission is disabled in Android settings.';
       store.setMonitoringError(err);
@@ -413,7 +422,7 @@ export async function copyToClipboard(text: string): Promise<boolean> {
  *
  * Flow:
  *  1. Record the notification event in the store.
- *  2. Verify the file still exists in Drive using the client's access token.
+ *  2. Verify the file still exists in Drive using the centralized token helper.
  *  3. Download and parse the CSV.
  *  4. Enqueue each receipt (existing duplicate protection applies).
  *  5. Start the print queue.
@@ -424,15 +433,10 @@ export async function handlePrintAction(intent: PrintIntentData): Promise<void> 
   if (!store) return;
   store.recordDriveNotification();
 
-  const accessToken = store.getAccessToken();
-  if (!accessToken) {
-    store.setMonitoringError('Cannot print: not signed in to Google Drive.');
-    return;
-  }
-
   try {
     // Step 1: Verify the file exists by listing the folder.
-    const csvFiles = await DriveService.listCsvFiles(accessToken, intent.folderId);
+    const csvFiles = await DriveService.listCsvFiles(intent.folderId);
+    store.setDriveAccessAvailable?.();
     const targetFile = csvFiles.find(f => f.id === intent.fileId);
 
     if (!targetFile) {
@@ -444,7 +448,12 @@ export async function handlePrintAction(intent: PrintIntentData): Promise<void> 
     }
 
     // Step 2: Download and parse.
-    const { receipts } = await DriveService.downloadAndParseCsv(accessToken, targetFile);
+    const { receipts } = await DriveService.downloadAndParseCsv(targetFile);
+    store.setDriveAccessAvailable?.();
+
+    // Track the complete CSV transaction count before any receipt is printed;
+    // archive eligibility must not depend on whether it came through the UI.
+    store.prepareCsvForQueue(targetFile.id, intent.folderId, receipts.length);
 
     // Step 3: Enqueue (duplicate-protected).
     for (const receipt of receipts) {
@@ -456,7 +465,13 @@ export async function handlePrintAction(intent: PrintIntentData): Promise<void> 
 
     store.setMonitoringError(null);
   } catch (e) {
-    store.setMonitoringError(`Print action failed: ${String(e)}`);
+    if (e instanceof DriveAuthError) {
+      store.setDriveNeedsReauth?.(true);
+      store.addDeferredFileId(deferredEntryForIntent(intent));
+      store.setMonitoringError('Google Drive authorization needs attention. Reconnect Google Drive in Settings.');
+    } else {
+      store.setMonitoringError(`Print action failed: ${String(e)}`);
+    }
   }
 }
 
@@ -483,38 +498,56 @@ export function handleLaterAction(fileId: string, folderId: string, fileName?: s
  *
  * The user must manually start printing from the Queue screen.
  */
-export async function runReconciliation(): Promise<void> {
-  if (!store) return;
+export async function runReconciliation(): Promise<number> {
+  if (!store || reconciliationInFlight) return 0;
 
-  const accessToken = store.getAccessToken();
   const folderId = store.getSourceFolderId();
 
-  if (!accessToken || !folderId) return;
+  if (!folderId) return 0;
+  reconciliationInFlight = true;
 
   store.recordReconciliation();
 
   const deferredIds = store.getDeferredFileIds ? store.getDeferredFileIds() : [];
   const deferredSet = new Set(deferredIds.map(d => d.split('::')[0]));
 
+  let discoveredTransactions = 0;
   try {
-    const csvFiles = await DriveService.listCsvFiles(accessToken, folderId);
+    const csvFiles = await DriveService.listCsvFiles(folderId);
+    store.setDriveAccessAvailable?.();
     for (const file of csvFiles) {
       // Prevent normal reconciliation from automatically enqueuing explicitly deferred files
       if (deferredSet.has(file.id)) {
         continue;
       }
+      // Durable queue/archive state already accounts for this file. Avoid
+      // downloading and parsing it again during a folder refresh.
+      if (store.isCsvKnown?.(file.id)) continue;
       try {
-        const { receipts } = await DriveService.downloadAndParseCsv(accessToken, file);
+        const { receipts } = await DriveService.downloadAndParseCsv(file);
+        store.setDriveAccessAvailable?.();
+        store.prepareCsvForQueue(file.id, folderId, receipts.length);
         for (const receipt of receipts) {
           store.enqueueReceipt(receipt);
         }
-      } catch (_) {
-        // Skip malformed/unreadable files — don't abort the whole pass.
+        discoveredTransactions += receipts.length;
+      } catch (e) {
+        if (e instanceof DriveAuthError) throw e;
+        console.warn(`[WinPrint][Monitoring] Skipping unreadable CSV ${file.id}:`, e);
       }
     }
     store.setMonitoringError(null);
+    return discoveredTransactions;
   } catch (e) {
-    store.setMonitoringError(`Reconciliation failed: ${String(e)}`);
+    if (e instanceof DriveAuthError) {
+      store.setDriveNeedsReauth?.(true);
+      store.setMonitoringError('Google Drive authorization needs attention. Reconnect Google Drive in Settings.');
+    } else {
+      store.setMonitoringError(`Reconciliation failed: ${String(e)}`);
+    }
+    return 0;
+  } finally {
+    reconciliationInFlight = false;
   }
 }
 
@@ -541,6 +574,8 @@ async function processDeferredNativeFiles(): Promise<void> {
       }
     } else if (typeof native.consumeDeferredFiles === 'function') {
       const entries = await native.consumeDeferredFiles();
+      // This legacy API consumes natively before resolving; always persist the
+      // returned entries even if authorization changed during the await.
       for (const entry of entries) {
         const [fileId, folderId] = entry.split('::');
         if (fileId && folderId) {
@@ -578,6 +613,7 @@ export function destroy(): void {
   subscriptions.length = 0;
   store = null;
   _initialized = false;
+  reconciliationInFlight = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -590,19 +626,20 @@ function onFcmTokenRefresh(token: string): void {
   // Re-register with the updated token if a folder is configured.
   const folderId = store.getSourceFolderId();
   if (folderId) {
-    registerDevice(token, folderId, true).catch(() => {});
+    registerDevice(token, folderId, true).catch(() => { });
   }
 }
 
 function onPrintActionReceived(data: PrintIntentData): void {
-  handlePrintAction(data).catch(() => {});
+  handlePrintAction(data).catch(() => { });
 }
 
 export function onLaterActionReceived(data: { fileId: string; folderId: string; fileName?: string }): void {
-  handleLaterAction(data.fileId, data.folderId, data.fileName);
+  if (!store) return;
   const entry = data.fileName
     ? `${data.fileId}::${data.folderId}::${data.fileName}`
     : `${data.fileId}::${data.folderId}`;
+  handleLaterAction(data.fileId, data.folderId, data.fileName);
   try {
     const native = NativeModules.WinsoftMonitoring || WinsoftMonitoring;
     if (native && typeof native.clearDeferredFiles === 'function') {
@@ -614,7 +651,7 @@ export function onLaterActionReceived(data: { fileId: string; folderId: string; 
 }
 
 export function onReconciliationRequested(): void {
-  runReconciliation().catch(() => {});
+  runReconciliation().catch(() => { });
 }
 
 export function onDeferredFilesReady(entries: string[]): void {

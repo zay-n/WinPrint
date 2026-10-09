@@ -34,11 +34,11 @@ describe('useAppStore - Auth Flows', () => {
       signInError: null,
     });
     jest.clearAllMocks();
+    (FirebaseAuthService.waitForInitialAuthState as jest.Mock).mockResolvedValue(null);
   });
 
   const mockGoogleResult: AuthResult = {
     user: {id: '123', email: 'test@example.com', name: 'Test', photo: null},
-    accessToken: 'google_access_token',
     idToken: 'google_id_token',
   };
 
@@ -57,7 +57,7 @@ describe('useAppStore - Auth Flows', () => {
 
     const state = useAppStore.getState();
     expect(state.user).toEqual(mockGoogleResult.user);
-    expect(state.accessToken).toEqual('google_access_token');
+    expect(state.accessToken).toBeNull();
     expect(state.authProfile).toBeDefined();
     expect(state.authProfile?.status).toBe('active');
   });
@@ -89,5 +89,74 @@ describe('useAppStore - Auth Flows', () => {
     expect(state.accessToken).toBeNull();
     expect(FirebaseAuthService.signOutFirebase).toHaveBeenCalled();
     expect(GoogleAuthService.signOut).toHaveBeenCalled();
+  });
+
+  it('waits for Firebase restoration before resolving an unauthenticated state', async () => {
+    let finishAuthState!: (value: null) => void;
+    (FirebaseAuthService.waitForInitialAuthState as jest.Mock).mockReturnValue(
+      new Promise(resolve => { finishAuthState = resolve; }),
+    );
+
+    const restoration = useAppStore.getState().restoreSession();
+    expect(useAppStore.getState().restoreSessionLoading).toBe(true);
+    finishAuthState(null);
+    await restoration;
+
+    expect(useAppStore.getState().restoreSessionLoading).toBe(false);
+    expect(useAppStore.getState().user).toBeNull();
+    expect(GoogleAuthService.signInSilently).not.toHaveBeenCalled();
+  });
+
+  it('restores Firebase identity when the Google native user cache is empty', async () => {
+    (FirebaseAuthService.waitForInitialAuthState as jest.Mock).mockResolvedValue({
+      uid: 'firebase-user', email: 'person@example.com', displayName: 'Person', photoURL: null,
+    });
+    (FirebaseAuthService.fetchUserProfile as jest.Mock).mockResolvedValue({
+      uid: 'firebase-user', email: 'person@example.com', displayName: 'Person', status: 'active', role: 'admin',
+    });
+    (GoogleAuthService.getCurrentUserSync as jest.Mock).mockReturnValue(null);
+
+    await useAppStore.getState().restoreSession();
+
+    expect(useAppStore.getState().user).toMatchObject({id: 'firebase-user', email: 'person@example.com'});
+    expect(GoogleAuthService.signInSilently).not.toHaveBeenCalled();
+  });
+
+  it('reconnects Drive without changing the Firebase application session', async () => {
+    const appUser = {id: 'firebase-user', email: 'person@example.com', name: 'Person', photo: null};
+    useAppStore.setState({user: appUser, driveNeedsReauth: true});
+    (GoogleAuthService.getCurrentUserSync as jest.Mock).mockReturnValue({
+      id: 'google-user', email: 'person@example.com', name: 'Person', photo: null,
+    });
+    (GoogleAuthService.getValidDriveAccessToken as jest.Mock).mockResolvedValue('fresh-drive-token');
+
+    await useAppStore.getState().reconnectGoogleDrive();
+
+    expect(useAppStore.getState().user).toEqual(appUser);
+    expect(useAppStore.getState().driveNeedsReauth).toBe(false);
+    expect(FirebaseAuthService.signInWithGoogleToken).not.toHaveBeenCalled();
+  });
+
+  it('clears Account A Google authorization before signing into Account B', async () => {
+    useAppStore.setState({user: {id: 'firebase-a', email: 'a@example.com', name: 'A', photo: null}});
+    (FirebaseAuthService.signOutFirebase as jest.Mock).mockResolvedValue(undefined);
+    await useAppStore.getState().signOut();
+
+    const accountB: AuthResult = {
+      user: {id: 'google-b', email: 'b@example.com', name: 'B', photo: null},
+      idToken: 'id-token-b',
+    };
+    (GoogleAuthService.signIn as jest.Mock).mockResolvedValue(accountB);
+    (FirebaseAuthService.signInWithGoogleToken as jest.Mock).mockResolvedValue('firebase-b');
+    (FirebaseAuthService.fetchUserProfile as jest.Mock).mockResolvedValue({
+      uid: 'firebase-b', email: 'b@example.com', displayName: 'B', status: 'active', role: 'admin',
+    });
+
+    await useAppStore.getState().signIn();
+
+    expect(GoogleAuthService.signOut).toHaveBeenCalled();
+    expect(FirebaseAuthService.signInWithGoogleToken).toHaveBeenCalledWith('id-token-b');
+    expect(useAppStore.getState().user?.email).toBe('b@example.com');
+    expect(useAppStore.getState().accessToken).toBeNull();
   });
 });

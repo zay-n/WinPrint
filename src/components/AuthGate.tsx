@@ -19,6 +19,8 @@ import {useAppStore} from '../store/useAppStore';
 import {Colors, Typography, Spacing, BorderRadius} from '../theme';
 import SignInScreen from '../screens/auth/SignInScreen';
 import Icon from './Icon';
+import {isAuthorizedAppSession, shouldShowAuthLoading} from '../services/auth/Authorization';
+import * as FirebaseAuthService from '../services/auth/FirebaseAuthService';
 
 // ─── Loading state ─────────────────────────────────────────────────────────────
 
@@ -138,31 +140,36 @@ export default function AuthGate({children}: {children: React.ReactNode}) {
   const restoreSessionLoading = useAppStore(s => s.restoreSessionLoading);
   const _hasHydrated = useAppStore(s => s._hasHydrated);
   const signInError = useAppStore(s => s.signInError);
+  const firebaseUid = FirebaseAuthService.getCurrentFirebaseUserUid();
+  const sameFirebaseSession = !!user && !!authProfile?.uid && firebaseUid === authProfile.uid;
 
-  // 1. Still loading session or hydrating persistence
-  if (restoreSessionLoading || !_hasHydrated) {
+  // Initial hydration/restoration must block the UI. During a background
+  // authorization refresh for the same Firebase user, keep the navigator
+  // mounted; monitoring is independently paused until that refresh completes.
+  // This avoids resetting the active screen when Android returns from system
+  // UI such as the notification-permission prompt.
+  if (shouldShowAuthLoading(_hasHydrated, restoreSessionLoading, sameFirebaseSession)) {
     return <LoadingView />;
   }
 
   // 2. Not signed in → show welcome / sign-in screen
   if (!user) {
+    if (signInError) {
+      return (
+        <BlockedView
+          variant="error"
+          onTryAgain={() => useAppStore.getState().restoreSession()}
+          onSignOut={signOut}
+        />
+      );
+    }
     return <SignInScreen />;
   }
 
   // 3. Signed in — check authorization
 
   const status = authProfile?.status;
-  const role = authProfile?.role;
-
-  // Determine if the user can pass into the main app
-  let canPass = false;
-  if (status === 'active') {
-    if (role === 'admin') {
-      canPass = true;
-    } else if (authProfile?.businessId && customer?.status === 'active') {
-      canPass = true;
-    }
-  }
+  const canPass = isAuthorizedAppSession(authProfile, customer);
 
   if (canPass) {
     return <>{children}</>;

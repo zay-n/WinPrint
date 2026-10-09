@@ -14,6 +14,7 @@
 import React, {useCallback, useEffect, useState} from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   Platform,
   Pressable,
@@ -29,6 +30,7 @@ import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
 import {useAppStore} from '../../store/useAppStore';
 import type {DriveFile} from '../../services/drive/DriveClient';
 import type {DriveScreenProps} from '../../navigation/types';
+import * as MonitoringService from '../../services/monitoring/MonitoringService';
 
 // ---------------------------------------------------------------------------
 // Main screen
@@ -36,7 +38,6 @@ import type {DriveScreenProps} from '../../navigation/types';
 
 export default function DriveScreen({navigation}: DriveScreenProps) {
   const user = useAppStore(s => s.user);
-  const accessToken = useAppStore(s => s.accessToken);
   const signInLoading = useAppStore(s => s.signInLoading);
   const signInError = useAppStore(s => s.signInError);
   const signIn = useAppStore(s => s.signIn);
@@ -57,6 +58,8 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   const selectFolder = useAppStore(s => s.selectFolder);
   const selectArchiveFolder = useAppStore(s => s.selectArchiveFolder);
   const loadCsvFiles = useAppStore(s => s.loadCsvFiles);
+  const driveNeedsReauth = useAppStore(s => s.driveNeedsReauth);
+  const lastReconciliationAt = useAppStore(s => s.lastReconciliationAt);
 
   const downloadAndParse = useAppStore(s => s.downloadAndParse);
   const receipts = useAppStore(s => s.receipts);
@@ -65,6 +68,7 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   const csvError = useAppStore(s => s.csvError);
 
   const [pickerMode, setPickerMode] = useState<'source' | 'archive' | null>(null);
+  const [refreshingFolder, setRefreshingFolder] = useState(false);
 
   // Automatically load CSV files when a source folder is configured
   useEffect(() => {
@@ -79,6 +83,40 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
     },
     [downloadAndParse],
   );
+
+  const handleRefreshFolder = useCallback(async () => {
+    if (refreshingFolder || csvLoading) return;
+    setRefreshingFolder(true);
+    try {
+      await loadCsvFiles();
+      const driveState = useAppStore.getState();
+      if (driveState.driveNeedsReauth) {
+        Alert.alert('Reconnect Google Drive', 'Google Drive authorization needs attention.', [
+          {text: 'Cancel', style: 'cancel'},
+          {text: 'Settings', onPress: () => navigation.navigate('Settings')},
+        ]);
+        return;
+      }
+      if (driveState.driveError) throw new Error(driveState.driveError);
+      const discovered = await MonitoringService.runReconciliation();
+      const state = useAppStore.getState();
+      if (state.driveNeedsReauth) {
+        Alert.alert('Reconnect Google Drive', 'Google Drive authorization needs attention.', [
+          {text: 'Cancel', style: 'cancel'},
+          {text: 'Settings', onPress: () => navigation.navigate('Settings')},
+        ]);
+        return;
+      }
+      if (state.lastMonitoringError) throw new Error(state.lastMonitoringError);
+      Alert.alert('Folder refreshed', discovered
+        ? `${discovered} new transaction${discovered === 1 ? '' : 's'} added to the queue. Nothing was printed.`
+        : 'The Incoming folder is up to date. Nothing was printed.');
+    } catch (error) {
+      Alert.alert('Refresh failed', error instanceof Error ? error.message : String(error));
+    } finally {
+      setRefreshingFolder(false);
+    }
+  }, [csvLoading, loadCsvFiles, navigation, refreshingFolder]);
 
   // ── Not signed in ─────────────────────────────────────────────────────────
 
@@ -225,11 +263,14 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
             <SectionLabel
               title="CSV Files in Folder"
               action={
-                <Pressable onPress={loadCsvFiles}>
-                  <Icon name="refresh" size={18} color={Colors.primary} />
+                <Pressable onPress={handleRefreshFolder} disabled={refreshingFolder || csvLoading} accessibilityRole="button" accessibilityLabel="Refresh Incoming folder">
+                  {refreshingFolder || csvLoading
+                    ? <ActivityIndicator size="small" color={Colors.primary} />
+                    : <Text style={styles.changeBtnText}>Refresh Folder</Text>}
                 </Pressable>
               }
             />
+            <Text style={styles.lastChecked}>Last checked: {lastReconciliationAt ? new Date(lastReconciliationAt).toLocaleString() : 'Not checked yet'}</Text>
             {csvLoading ? (
               <ActivityIndicator color={Colors.primary} style={styles.loader} />
             ) : (
@@ -297,7 +338,6 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
       <DriveFolderPickerModal
         visible={pickerMode !== null}
         title={pickerMode === 'archive' ? 'Select Printed Folder' : 'Select Incoming Folder'}
-        accessToken={accessToken}
         initialFolderId={pickerMode === 'archive' ? archiveFolderId : sourceFolderId}
         initialFolderName={pickerMode === 'archive' ? archiveFolderName : sourceFolderName}
         onSelect={folder => {
@@ -607,6 +647,7 @@ const styles = StyleSheet.create({
   },
 
   loader: {marginVertical: Spacing.md},
+  lastChecked: { ...Typography.caption, color: Colors.textTertiary, marginTop: -Spacing.xs },
   emptyMsg: {
     ...Typography.body,
     color: Colors.textTertiary,

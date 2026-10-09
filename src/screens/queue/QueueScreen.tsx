@@ -206,7 +206,7 @@ function QueueItemRow({ item }: { item: QueueItem }) {
             {item.receipt.transactionType} {item.receipt.transactionNumber}
           </Text>
         </View>
-        <Text style={[styles.itemStatus, {color: statusColor}]}>
+        <Text style={[styles.itemStatus, { color: statusColor }]}>
           {statusLabel}
         </Text>
       </View>
