@@ -37,12 +37,13 @@ class WinsoftFcmService : FirebaseMessagingService() {
         const val PREF_FCM_TOKEN = "winprint_fcm_token"
         const val PREFS_NAME = "winprint_monitoring"
         const val ACTION_LATER = "com.winsoftprintstation.ACTION_LATER"
+        const val ACTION_PRINT = "com.winsoftprintstation.ACTION_PRINT"
         const val EXTRA_FILE_ID = "fileId"
         const val EXTRA_FILE_NAME = "fileName"
         const val EXTRA_FOLDER_ID = "folderId"
         // Notification IDs are based on the fileId hashCode so each file
         // gets a unique notification that can be individually dismissed.
-        private fun notificationId(fileId: String) = fileId.hashCode()
+        internal fun notificationId(fileId: String) = fileId.hashCode()
     }
 
     // -------------------------------------------------------------------------
@@ -118,7 +119,7 @@ class WinsoftFcmService : FirebaseMessagingService() {
             "&fileName=${Uri.encode(fileName)}"
         )
         val printIntent = Intent(this, MainActivity::class.java).apply {
-            action = "com.winsoftprintstation.ACTION_PRINT"
+            action = ACTION_PRINT
             data = printUri
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }

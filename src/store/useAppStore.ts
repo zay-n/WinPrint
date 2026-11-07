@@ -1,5 +1,5 @@
 /**
- * useAppStore.ts — Zustand application state
+ * useAppStore.ts â€” Zustand application state
  *
  * Manages slices for Auth, Drive, CSV, PDF, Printer, Queue, and Monitoring.
  *
@@ -37,6 +37,7 @@ import * as MonitoringService from '../services/monitoring/MonitoringService';
 
 const archiveMovesInFlight = new Set<string>();
 const reprintsInFlight = new Set<string>();
+let queueProcessingInFlight = false;
 
 // ---------------------------------------------------------------------------
 // Profile slice
@@ -61,14 +62,14 @@ interface ProfileActions {
 
 /**
  * Auth state machine:
- *  restoreSessionLoading=true  → AUTH_CHECKING   (show loading spinner)
- *  user !== null               → AUTHENTICATED   (may show blocked screens)
- *  user === null (after check) → UNAUTHENTICATED  (show sign-in screen)
- *  signInError !== null        → AUTH_ERROR       (show error + retry)
+ *  restoreSessionLoading=true  â†’ AUTH_CHECKING   (show loading spinner)
+ *  user !== null               â†’ AUTHENTICATED   (may show blocked screens)
+ *  user === null (after check) â†’ UNAUTHENTICATED  (show sign-in screen)
+ *  signInError !== null        â†’ AUTH_ERROR       (show error + retry)
  *
  * Drive state:
- *  driveNeedsReauth=false → DRIVE_CONNECTED (normal operation)
- *  driveNeedsReauth=true  → DRIVE_NEEDS_REAUTH (show reconnect button)
+ *  driveNeedsReauth=false â†’ DRIVE_CONNECTED (normal operation)
+ *  driveNeedsReauth=true  â†’ DRIVE_NEEDS_REAUTH (show reconnect button)
  */
 interface AuthState {
   user: GoogleUser | null;
@@ -199,7 +200,7 @@ interface PrinterActions {
 // Queue & Archive slice
 // ---------------------------------------------------------------------------
 
-export type PrintStatus = 'QUEUED' | 'PRINTING' | 'PRINTED' | 'FAILED';
+export type PrintStatus = 'QUEUED' | 'PRINTING' | 'PRINTED' | 'FAILED' | 'CANCELLED';
 
 export interface QueueItem {
   identity: string;
@@ -237,6 +238,7 @@ interface QueueActions {
   prepareCsvForQueue: (driveFileId: string, sourceFolderId: string, expectedCount: number) => void;
   updateQueueItemStatus: (identity: string, status: PrintStatus, error?: string) => Promise<void>;
   retryFailedPrints: () => void;
+  cancelQueueItem: (identity: string) => boolean;
   retryArchive: (driveFileId: string) => Promise<void>;
   resumePendingArchives: () => Promise<void>;
   clearHistory: () => void;
@@ -293,6 +295,15 @@ interface HydrationActions {
   setHasHydrated: (hydrated: boolean) => void;
 }
 
+interface OnboardingState {
+  /** Current guide step only; completion is derived from real app configuration. */
+  onboardingStep: number;
+}
+
+interface OnboardingActions {
+  setOnboardingStep: (step: number) => void;
+}
+
 // ---------------------------------------------------------------------------
 // Combined store
 // ---------------------------------------------------------------------------
@@ -313,6 +324,8 @@ type AppStore = ProfileState &
   QueueActions &
   MonitoringState &
   MonitoringActions &
+  OnboardingState &
+  OnboardingActions &
   HydrationState &
   HydrationActions;
 
@@ -320,12 +333,14 @@ type AppStore = ProfileState &
 export const useAppStore = create<AppStore>()(
   persist(
     (set, get) => ({
-      // ── Profile initial state ───────────────────────────────────────────────
+      // â”€â”€ Profile initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       businessProfile: DEFAULT_BUSINESS_PROFILE,
       a4Template: DEFAULT_A4_TEMPLATE,
       thermalTemplate: DEFAULT_THERMAL_TEMPLATE,
+      onboardingStep: 0,
+      setOnboardingStep: (step: number) => set({onboardingStep: Math.max(0, Math.min(4, Math.floor(step)))}),
 
-      // ── Profile actions ─────────────────────────────────────────────────────
+      // â”€â”€ Profile actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       updateBusinessProfile: (partial) => set((state) => ({
         businessProfile: { ...state.businessProfile, ...partial },
         generatedPdfPaths: {}, // Invalidate cache so preview regenerates
@@ -344,7 +359,7 @@ export const useAppStore = create<AppStore>()(
         generatedPdfPaths: {}, // Invalidate cache so preview regenerates
       }),
 
-      // ── Auth initial state ──────────────────────────────────────────────────
+      // â”€â”€ Auth initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       user: null,
       authProfile: null,
       customer: null,
@@ -353,17 +368,17 @@ export const useAppStore = create<AppStore>()(
       restoreSessionLoading: false,
       signInError: null,
 
-      // ── Auth actions ────────────────────────────────────────────────────────
+      // â”€â”€ Auth actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
       signIn: async () => {
         set({ signInLoading: true, signInError: null });
         try {
-          // ── STAGE 1: Configure Google Sign-In ─────────────────────────────
+          // â”€â”€ STAGE 1: Configure Google Sign-In â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           // configure() must be called before signIn() so the native module
           // is fully initialized. It is idempotent.
           GoogleAuthService.configure();
 
-          // ── STAGE 2: Google Sign-In ────────────────────────────────────────
+          // â”€â”€ STAGE 2: Google Sign-In â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           console.log('[WinPrint][Auth] STAGE 1: Starting Google Sign-In');
           let result: import('../services/auth/GoogleAuthService').AuthResult;
           try {
@@ -376,7 +391,7 @@ export const useAppStore = create<AppStore>()(
           } catch (googleErr: unknown) {
             const ge = googleErr as { code?: string; message?: string };
             if (ge?.code === 'CANCELLED' || ge?.code === 'SIGN_IN_CANCELLED') {
-              console.log('[WinPrint][Auth]   → User cancelled account picker (not an error)');
+              console.log('[WinPrint][Auth]   â†’ User cancelled account picker (not an error)');
               set({ signInLoading: false, signInError: null });
               return;
             }
@@ -384,7 +399,7 @@ export const useAppStore = create<AppStore>()(
             throw googleErr;
           }
 
-          // ── STAGE 3: Firebase signInWithCredential ─────────────────────────
+          // â”€â”€ STAGE 3: Firebase signInWithCredential â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           console.log('[WinPrint][Auth] STAGE 2: Firebase signInWithCredential');
           let uid: string;
           try {
@@ -396,7 +411,7 @@ export const useAppStore = create<AppStore>()(
             throw firebaseErr;
           }
 
-          // ── STAGE 4: Firestore user profile ───────────────────────────────
+          // â”€â”€ STAGE 4: Firestore user profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           console.log('[WinPrint][Auth] STAGE 3: Fetching Firestore user profile');
           let authProfile: FirebaseAuthService.UserProfile | null;
           try {
@@ -408,7 +423,7 @@ export const useAppStore = create<AppStore>()(
             throw profileErr;
           }
 
-          // ── STAGE 5: Customer lookup (conditional) ─────────────────────────
+          // â”€â”€ STAGE 5: Customer lookup (conditional) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           let customer: FirebaseAuthService.Customer | null = null;
           if (authProfile?.status === 'active' && authProfile.businessId) {
             console.log('[WinPrint][Auth] STAGE 4: Fetching customer for businessId:', authProfile.businessId);
@@ -418,8 +433,8 @@ export const useAppStore = create<AppStore>()(
             } catch (customerErr: unknown) {
               const ce = customerErr as { code?: string; message?: string };
               console.error('[WinPrint][Auth] STAGE 4 FAILED: Customer fetch error, code:', ce?.code);
-              // Non-fatal — allow sign-in to complete
-              console.warn('[WinPrint][Auth]   → Continuing with null customer');
+              // Non-fatal â€” allow sign-in to complete
+              console.warn('[WinPrint][Auth]   â†’ Continuing with null customer');
             }
           } else {
             console.log('[WinPrint][Auth] STAGE 4: Skipped (status:', authProfile?.status, '/ businessId:', authProfile?.businessId ?? 'none)');
@@ -430,7 +445,7 @@ export const useAppStore = create<AppStore>()(
             user: result.user,
             authProfile,
             customer,
-            accessToken: null, // Not stored — Drive uses on-demand tokens from DriveClient
+            accessToken: null, // Not stored â€” Drive uses on-demand tokens from DriveClient
             driveNeedsReauth: false,
             driveAccessChecked: false,
             signInLoading: false,
@@ -491,7 +506,7 @@ export const useAppStore = create<AppStore>()(
         console.log('[WinPrint][Auth] Google Sign-In configured');
 
         try {
-          // ── Step 1: Check Firebase Auth state (authoritative session source) ──
+          // â”€â”€ Step 1: Check Firebase Auth state (authoritative session source) â”€â”€
           // Firebase Auth persists the session across app restarts.
           // We do NOT rely on Google Sign-In state to determine if the user
           // is logged into Firebase.
@@ -501,7 +516,7 @@ export const useAppStore = create<AppStore>()(
           if (firebaseUser) {
             console.log('[WinPrint][Auth] Firebase user restored (uid length:', firebaseUser.uid?.length, ')');
 
-            // ── Step 2: Load Firestore profile ──────────────────────────────
+            // â”€â”€ Step 2: Load Firestore profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             console.log('[WinPrint][Auth] Fetching Firestore profile...');
             const authProfile = await FirebaseAuthService.fetchUserProfile(
               firebaseUser.uid,
@@ -510,11 +525,11 @@ export const useAppStore = create<AppStore>()(
             );
             console.log('[WinPrint][Auth] Profile: status:', authProfile?.status, 'role:', authProfile?.role);
 
-            // ── Step 3: Restore Google user info (for display purposes) ─────
+            // â”€â”€ Step 3: Restore Google user info (for display purposes) â”€â”€â”€â”€â”€
             // The Google Sign-In native layer may or may not have a cached user
             // after a cold start. We get it synchronously if available; if not,
             // we construct a GoogleUser from Firebase data. This does NOT affect
-            // Drive token availability — DriveClient gets tokens on-demand.
+            // Drive token availability â€” DriveClient gets tokens on-demand.
             // Firebase identity is authoritative; native Google state is only
             // needed later when a Drive operation obtains its OAuth token.
             const googleUser: GoogleUser = {
@@ -524,7 +539,7 @@ export const useAppStore = create<AppStore>()(
               photo: firebaseUser.photoURL ?? null,
             };
 
-            // ── Step 4: Customer lookup ──────────────────────────────────────
+            // â”€â”€ Step 4: Customer lookup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             let customer: FirebaseAuthService.Customer | null = null;
             if (authProfile?.status === 'active' && authProfile.businessId) {
               try {
@@ -605,7 +620,7 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      // ── Drive initial state ─────────────────────────────────────────────────
+      // â”€â”€ Drive initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       sourceFolderId: null,
       sourceFolderName: null,
       sourceFolderPath: null,
@@ -622,10 +637,10 @@ export const useAppStore = create<AppStore>()(
       driveNeedsReauth: false,
       driveAccessChecked: false,
 
-      // ── Drive actions ───────────────────────────────────────────────────────
+      // â”€â”€ Drive actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
       loadFolders: async (parentId = 'root') => {
-        // No accessToken check needed — DriveClient fetches token on-demand.
+        // No accessToken check needed â€” DriveClient fetches token on-demand.
         // We still require user to be signed in.
         if (!get().user) {
           set({ driveError: 'Not signed in.' });
@@ -706,7 +721,7 @@ export const useAppStore = create<AppStore>()(
             }
           } catch (e: unknown) {
             if (e instanceof DriveAuthError) {
-              // Don't mark folder invalid on auth error — token will refresh
+              // Don't mark folder invalid on auth error â€” token will refresh
               set({ driveNeedsReauth: true, driveAccessChecked: true });
               return;
             }
@@ -718,7 +733,7 @@ export const useAppStore = create<AppStore>()(
                 driveError: 'Access to the configured source folder was revoked or it was deleted.',
               });
             } else {
-              // Network/temporary error — keep valid
+              // Network/temporary error â€” keep valid
               set({ sourceFolderValid: true });
             }
           }
@@ -774,13 +789,13 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      // ── CSV initial state ───────────────────────────────────────────────────
+      // â”€â”€ CSV initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       receipts: [],
       parseLoading: false,
       csvError: null,
       lastParsedFileId: null,
 
-      // ── CSV actions ─────────────────────────────────────────────────────────
+      // â”€â”€ CSV actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
       downloadAndParse: async (file: DriveFile) => {
         const { sourceFolderId, user } = get();
@@ -788,25 +803,64 @@ export const useAppStore = create<AppStore>()(
           set({ csvError: 'Not signed in.' });
           return;
         }
+
+        // 'root' is not a valid source folder for Drive archive moves. If no
+        // Incoming folder has been configured, parse the CSV so receipts can
+        // be queued and printed, but skip csvProgress setup and warn the user
+        // that archive will not run until the folder is configured.
+        const hasValidSourceFolder = Boolean(sourceFolderId) && sourceFolderId !== 'root';
+        if (!hasValidSourceFolder) {
+          console.warn(
+            '[WinPrint][Queue] downloadAndParse: sourceFolderId is ' +
+            `"${sourceFolderId ?? 'null'}" â€” archive accounting will not be recorded. ` +
+            'Configure the Incoming folder in Settings > Drive before parsing CSVs that should be archived.',
+          );
+        }
+
+        console.log(
+          `[WinPrint][Queue] downloadAndParse: file=${file.id} ("${file.name}"), ` +
+          `sourceFolderId=${sourceFolderId ?? 'null'}, hasValidSourceFolder=${hasValidSourceFolder}`,
+        );
         set({ parseLoading: true, csvError: null, driveNeedsReauth: false });
         try {
           const result = await DriveService.downloadAndParseCsv(file);
-          // Populate durable archive accounting as soon as the complete CSV is parsed.
-          get().prepareCsvForQueue(file.id, sourceFolderId || 'root', result.receipts.length);
-          set((state) => {
-            return {
-              receipts: result.receipts,
-              parseLoading: false,
-              lastParsedFileId: file.id,
-              driveAccessChecked: true,
-              driveNeedsReauth: false,
-              generatedPdfPaths: {},
-              pdfError: null,
-            };
-          });
+
+          if (hasValidSourceFolder) {
+            // Record durable archive accounting only when the real Incoming folder
+            // ID is known. prepareCsvForQueue also guards against 'root', so this
+            // check is redundant but adds defense in depth.
+            get().prepareCsvForQueue(file.id, sourceFolderId!, result.receipts.length);
+            console.log(
+              `[WinPrint][Queue] downloadAndParse: parsed ${result.receipts.length} receipt(s) ` +
+              `from ${file.id}, csvProgress recorded with sourceFolderId=${sourceFolderId}`,
+            );
+          } else {
+            console.warn(
+              `[WinPrint][Queue] downloadAndParse: parsed ${result.receipts.length} receipt(s) ` +
+              `from ${file.id} WITHOUT archive accounting (no valid Incoming folder). ` +
+              'Go to Settings > Drive, set the Incoming folder, then re-parse this CSV to enable archiving.',
+            );
+          }
+
+          set(() => ({
+            receipts: result.receipts,
+            parseLoading: false,
+            lastParsedFileId: file.id,
+            driveAccessChecked: true,
+            driveNeedsReauth: false,
+            generatedPdfPaths: {},
+            pdfError: null,
+            // Surfaces a non-blocking warning to the CSV/Queue screens when the
+            // Incoming folder has not been configured.
+            csvError: hasValidSourceFolder
+              ? null
+              : 'No Incoming folder configured â€” receipts queued without archive tracking. ' +
+                'Set the Incoming folder in Settings > Drive to enable automatic archiving.',
+          }));
         } catch (e: unknown) {
           const isDriveAuthError = e instanceof DriveAuthError;
           const err = e as { message?: string };
+          console.error(`[WinPrint][Queue] downloadAndParse failed for ${file.id}:`, err?.message);
           set({
             parseLoading: false,
             csvError: isDriveAuthError
@@ -829,12 +883,12 @@ export const useAppStore = create<AppStore>()(
         });
       },
 
-      // ── Receipt PDF initial state ───────────────────────────────────────────
+      // â”€â”€ Receipt PDF initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       generatedPdfPaths: {},
       generatingReceiptIndex: null,
       pdfError: null,
 
-      // ── Receipt PDF actions ─────────────────────────────────────────────────
+      // â”€â”€ Receipt PDF actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
       generateReceiptPdf: async (receiptIndex: number) => {
         const receipt = get().receipts[receiptIndex];
@@ -865,7 +919,7 @@ export const useAppStore = create<AppStore>()(
 
       clearPdfError: () => set({ pdfError: null }),
 
-      // ── Printer initial state ───────────────────────────────────────────────
+      // â”€â”€ Printer initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       selectedPrinterType: 'office',
       selectedBluetoothDevice: null,
       pairedDevices: [],
@@ -874,7 +928,7 @@ export const useAppStore = create<AppStore>()(
       printerError: null,
       lastPrintResult: null,
 
-      // ── Printer actions ─────────────────────────────────────────────────────
+      // â”€â”€ Printer actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
       setPrinterType: (type: PrinterType) => {
         set({ selectedPrinterType: type, printerError: null, lastPrintResult: null });
@@ -912,6 +966,11 @@ export const useAppStore = create<AppStore>()(
 
       printReceipt: async (receipt: Receipt) => {
         const { selectedPrinterType, selectedBluetoothDevice, businessProfile, a4Template, thermalTemplate } = get();
+        const identity = receiptIdentity(receipt);
+        console.log(
+          `[WinPrint][Print] printReceipt() â€” identity: ${identity}, ` +
+          `printerType: ${selectedPrinterType}, driveFileId: ${receipt.sourceFile?.driveFileId ?? 'none'}`,
+        );
         set({ printLoading: true, printerError: null });
         try {
           const adapter = PrinterService.getAdapter(selectedPrinterType);
@@ -924,21 +983,27 @@ export const useAppStore = create<AppStore>()(
           }
           const template = selectedPrinterType === 'office' ? a4Template : thermalTemplate;
           const result = await adapter.print(receipt, businessProfile, template);
+          console.log(
+            `[WinPrint][Print] printReceipt() result â€” identity: ${identity}, ` +
+            `success: ${result.success}${result.error ? `, error: ${result.error}` : ''}`,
+          );
           set({
-            printLoading: false,
             lastPrintResult: result,
             printerError: result.success ? null : (result.error ?? 'Print failed.'),
           });
           return result;
         } catch (e: unknown) {
           const message = e instanceof Error ? e.message : String(e);
+          console.error(`[WinPrint][Print] printReceipt() threw â€” identity: ${identity}, error: ${message}`);
           const failResult = { success: false, error: message };
           set({
-            printLoading: false,
             lastPrintResult: failResult,
             printerError: message,
           });
           return failResult;
+        } finally {
+          // Always reset printLoading so the UI button cannot get permanently stuck.
+          set({ printLoading: false });
         }
       },
 
@@ -975,12 +1040,12 @@ export const useAppStore = create<AppStore>()(
 
       clearPrinterError: () => set({ printerError: null }),
 
-      // ── Queue & Archive initial state ───────────────────────────────────────
+      // â”€â”€ Queue & Archive initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       queue: [],
       csvProgress: {},
       reprintHistory: [],
 
-      // ── Queue & Archive actions ─────────────────────────────────────────────
+      // â”€â”€ Queue & Archive actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
       enqueueReceipt: (receipt: Receipt) => {
         const identity = receiptIdentity(receipt);
@@ -1006,7 +1071,19 @@ export const useAppStore = create<AppStore>()(
       },
 
       prepareCsvForQueue: (driveFileId: string, sourceFolderId: string, expectedCount: number) => {
-        if (!driveFileId || !sourceFolderId || !Number.isFinite(expectedCount) || expectedCount <= 0) return;
+        // 'root' is never a valid Incoming folder for archive moves â€” it is only a
+        // Drive API shorthand and cannot be used as a removeParents source.
+        const isInvalidSourceFolder = !sourceFolderId || sourceFolderId === 'root';
+        if (!driveFileId || isInvalidSourceFolder || !Number.isFinite(expectedCount) || expectedCount <= 0) {
+          if (driveFileId && isInvalidSourceFolder) {
+            console.warn(
+              `[WinPrint][Queue] prepareCsvForQueue: invalid sourceFolderId="${sourceFolderId}" for ` +
+              `driveFileId=${driveFileId}. CSV progress not recorded â€” archive will not trigger. ` +
+              'Configure the Incoming folder in Drive Settings before parsing CSVs.',
+            );
+          }
+          return;
+        }
         const state = get();
         const existing = state.csvProgress[driveFileId];
         const printedInQueue = state.queue.filter(
@@ -1039,9 +1116,36 @@ export const useAppStore = create<AppStore>()(
       updateQueueItemStatus: async (identity: string, status: PrintStatus, error?: string) => {
         const { queue, csvProgress } = get();
         const itemIndex = queue.findIndex(q => q.identity === identity);
-        if (itemIndex === -1) return;
+        if (itemIndex === -1) {
+          console.warn(`[WinPrint][Queue] updateQueueItemStatus: item not found â€” identity: ${identity}, target: ${status}`);
+          return;
+        }
 
         const item = queue[itemIndex];
+        if (status === 'PRINTING' && item.status !== 'QUEUED') {
+          console.warn(
+            `[WinPrint][Queue] updateQueueItemStatus: PRINTING rejected (not QUEUED) â€” ` +
+            `identity: ${identity}, currentStatus: ${item.status}`,
+          );
+          return;
+        }
+        if ((status === 'PRINTED' || status === 'FAILED') && item.status !== 'PRINTING') {
+          console.warn(
+            `[WinPrint][Queue] updateQueueItemStatus: ${status} rejected (not PRINTING) â€” ` +
+            `identity: ${identity}, currentStatus: ${item.status}`,
+          );
+          return;
+        }
+        if (status === 'CANCELLED') {
+          // Cancellation must go through cancelQueueItem() for atomicity.
+          return;
+        }
+
+        console.log(
+          `[WinPrint][Queue] updateQueueItemStatus: ${item.status} â†’ ${status} â€” identity: ${identity}` +
+          (error ? ` (error: ${error})` : ''),
+        );
+
         const updatedItem = {
           ...item,
           status,
@@ -1065,14 +1169,34 @@ export const useAppStore = create<AppStore>()(
                 ...prog,
                 printedCount: newPrintedCount,
               };
+              console.log(
+                `[WinPrint][Queue] CSV progress â€” driveFileId: ${driveFileId}, ` +
+                `printedCount: ${newPrintedCount}/${prog.expectedCount}, ` +
+                `archiveStatus: ${prog.archiveStatus}, sourceFolderId: ${prog.sourceFolderId}`,
+              );
 
               if (newPrintedCount >= prog.expectedCount && prog.archiveStatus === 'PENDING') {
                 // Persist successful print accounting before performing the
                 // network move, so an app restart can safely resume archiving.
                 newCsvProgress[driveFileId].archiveStatus = 'ARCHIVING';
                 archiveFileId = driveFileId;
+                console.log(
+                  `[WinPrint][Queue] All ${newPrintedCount} receipt(s) printed â€” ` +
+                  `scheduling archive for driveFileId: ${driveFileId}`,
+                );
               }
+            } else {
+              console.warn(
+                `[WinPrint][Queue] PRINTED but no csvProgress entry for driveFileId: ${driveFileId} ` +
+                `(identity: ${identity}). Archive will not trigger. ` +
+                'Ensure prepareCsvForQueue() was called before enqueueReceipt().',
+              );
             }
+          } else {
+            console.warn(
+              `[WinPrint][Queue] PRINTED but receipt has no driveFileId (identity: ${identity}). ` +
+              'Archive will not trigger â€” source file cannot be located.',
+            );
           }
         }
 
@@ -1086,39 +1210,112 @@ export const useAppStore = create<AppStore>()(
         set({ queue: newQueue });
       },
 
+      cancelQueueItem: (identity: string) => {
+        let cancelled = false;
+        set(state => {
+          const itemIndex = state.queue.findIndex(item => item.identity === identity);
+          if (itemIndex < 0 || state.queue[itemIndex].status !== 'QUEUED') return state;
+          const queue = [...state.queue];
+          queue[itemIndex] = {
+            ...queue[itemIndex],
+            status: 'CANCELLED',
+            completedAt: Date.now(),
+            error: undefined,
+          };
+          cancelled = true;
+          return {queue};
+        });
+        return cancelled;
+      },
       retryArchive: async (driveFileId: string) => {
         const { csvProgress, archiveFolderId, user } = get();
         const prog = csvProgress[driveFileId];
-        if (!prog || prog.archiveStatus === 'ARCHIVED' || prog.printedCount < prog.expectedCount) return;
-        if (prog.archiveStatus !== 'FAILED' && prog.archiveStatus !== 'ARCHIVING' && prog.archiveStatus !== 'PENDING') return;
-        if (archiveMovesInFlight.has(driveFileId)) return;
 
-        if (!user || !archiveFolderId) {
-          set({
+        console.log(
+          `[WinPrint][Archive] retryArchive() â€” driveFileId: ${driveFileId}, ` +
+          `archiveStatus: ${prog?.archiveStatus ?? 'NO_ENTRY'}, ` +
+          `printedCount: ${prog?.printedCount ?? 0}/${prog?.expectedCount ?? 0}, ` +
+          `sourceFolderId: ${prog?.sourceFolderId ?? 'null'}, ` +
+          `archiveFolderId: ${archiveFolderId ?? 'null (NOT CONFIGURED)'}`,
+        );
+
+        if (!prog || prog.archiveStatus === 'ARCHIVED' || prog.printedCount < prog.expectedCount) {
+          console.log(`[WinPrint][Archive] retryArchive: not ready â€” skipping ${driveFileId}`);
+          return;
+        }
+        if (prog.archiveStatus !== 'FAILED' && prog.archiveStatus !== 'ARCHIVING' && prog.archiveStatus !== 'PENDING') {
+          console.log(`[WinPrint][Archive] retryArchive: archiveStatus=${prog.archiveStatus} â€” skipping ${driveFileId}`);
+          return;
+        }
+        if (archiveMovesInFlight.has(driveFileId)) {
+          console.log(`[WinPrint][Archive] retryArchive: already in flight â€” ${driveFileId}`);
+          return;
+        }
+
+        if (!user) {
+          const archiveError = 'Sign in again to archive this printed CSV.';
+          console.warn(`[WinPrint][Archive] No user â€” archiveStatus set to FAILED for ${driveFileId}`);
+          set(state => ({
             csvProgress: {
-              ...csvProgress,
-              [driveFileId]: {
-                ...prog,
-                archiveStatus: 'FAILED',
-                archiveError: !user
-                  ? 'Sign in again to archive this printed CSV.'
-                  : 'Select a Printed/archive folder in Drive settings, then retry the archive.',
-              }
+              ...state.csvProgress,
+              [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'FAILED', archiveError },
             }
-          });
+          }));
+          return;
+        }
+
+        if (!archiveFolderId) {
+          const archiveError = 'Select a Printed/archive folder in Drive settings, then retry the archive.';
+          console.warn(
+            `[WinPrint][Archive] archiveFolderId is null â€” cannot move ${driveFileId}. ` +
+            'Set the archive folder in Settings > Drive, then tap Retry Archive.',
+          );
+          set(state => ({
+            csvProgress: {
+              ...state.csvProgress,
+              [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'FAILED', archiveError },
+            }
+          }));
+          return;
+        }
+
+        // 'root' and '' are both invalid source folders â€” 'root' is a Drive API
+        // alias that cannot be used as a removeParents parameter; it would not
+        // match the file's real parent, silently leaving the file un-moved.
+        const isInvalidSource = !prog.sourceFolderId || prog.sourceFolderId === 'root';
+        if (isInvalidSource) {
+          const archiveError =
+            'Cannot archive: the Incoming folder ID was not recorded when this CSV was parsed. ' +
+            'Go to Settings > Drive, configure the Incoming folder, then re-parse the CSV.';
+          console.warn(
+            `[WinPrint][Archive] sourceFolderId="${prog.sourceFolderId}" is invalid for driveFileId: ${driveFileId}. ` +
+            'Archive aborted â€” "root" and "" are not valid removeParents values for a Drive PATCH move.',
+          );
+          set(state => ({
+            csvProgress: {
+              ...state.csvProgress,
+              [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'FAILED', archiveError },
+            }
+          }));
           return;
         }
 
         archiveMovesInFlight.add(driveFileId);
-        set({
+        set(state => ({
           csvProgress: {
-            ...csvProgress,
-            [driveFileId]: { ...prog, archiveStatus: 'ARCHIVING', archiveError: undefined }
+            ...state.csvProgress,
+            [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'ARCHIVING', archiveError: undefined }
           }
-        });
+        }));
+
+        console.log(
+          `[WinPrint][Archive] Drive PATCH move â€” driveFileId: ${driveFileId}, ` +
+          `from: ${prog.sourceFolderId} â†’ to: ${archiveFolderId}`,
+        );
 
         try {
           await DriveService.moveFile(driveFileId, prog.sourceFolderId, archiveFolderId);
+          console.log(`[WinPrint][Archive] Move succeeded â€” ${driveFileId} confirmed in Printed folder`);
           set(state => ({
             driveAccessChecked: true,
             driveNeedsReauth: false,
@@ -1132,6 +1329,10 @@ export const useAppStore = create<AppStore>()(
           const msg = isDriveAuthError
             ? 'Archive failed: Google Drive authorization needs attention.'
             : (e instanceof Error ? e.message : String(e));
+          console.error(
+            `[WinPrint][Archive] Move FAILED â€” driveFileId: ${driveFileId}, ` +
+            `error: ${msg}, isDriveAuthError: ${isDriveAuthError}`,
+          );
           set(state => ({
             csvProgress: {
               ...state.csvProgress,
@@ -1162,20 +1363,64 @@ export const useAppStore = create<AppStore>()(
       },
 
       processQueue: async () => {
-        // Sequential processing loop
-        while (true) {
-          const { queue, printReceipt, updateQueueItemStatus } = get();
-          const nextItem = queue.find(q => q.status === 'QUEUED');
-          if (!nextItem) break;
+        if (queueProcessingInFlight) {
+          console.log('[WinPrint][Queue] processQueue: already in flight, skipping');
+          return;
+        }
+        queueProcessingInFlight = true;
+        console.log('[WinPrint][Queue] processQueue: started');
+        try {
+          while (true) {
+            const {queue, printReceipt, updateQueueItemStatus} = get();
+            const nextItem = queue.find(item => item.status === 'QUEUED');
+            if (!nextItem) {
+              console.log('[WinPrint][Queue] processQueue: no QUEUED items remain, done');
+              break;
+            }
 
-          await updateQueueItemStatus(nextItem.identity, 'PRINTING');
-          const result = await printReceipt(nextItem.receipt);
+            console.log(
+              `[WinPrint][Queue] processQueue: claiming item â€” identity: ${nextItem.identity}, ` +
+              `driveFileId: ${nextItem.receipt.sourceFile?.driveFileId ?? 'none'}`,
+            );
 
-          if (result.success) {
-            await updateQueueItemStatus(nextItem.identity, 'PRINTED');
-          } else {
-            await updateQueueItemStatus(nextItem.identity, 'FAILED', result.error);
+            // Atomically claim the item as PRINTING so a concurrent cancel
+            // cannot race and start a second print of the same item.
+            await updateQueueItemStatus(nextItem.identity, 'PRINTING');
+
+            // Verify the transition succeeded. If not (item was concurrently cancelled),
+            // skip it and look for the next QUEUED item.
+            const claimedItem = get().queue.find(item => item.identity === nextItem.identity);
+            if (claimedItem?.status !== 'PRINTING') {
+              console.warn(
+                `[WinPrint][Queue] processQueue: item ${nextItem.identity} was not claimed as PRINTING ` +
+                `(current status: ${claimedItem?.status ?? 'not found'}), skipping`,
+              );
+              continue;
+            }
+
+            let result: PrintResult;
+            try {
+              result = await printReceipt(nextItem.receipt);
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error);
+              console.error(`[WinPrint][Queue] processQueue: printReceipt threw â€” ${nextItem.identity}: ${msg}`);
+              result = {success: false, error: msg};
+            }
+
+            console.log(
+              `[WinPrint][Queue] processQueue: print result â€” identity: ${nextItem.identity}, ` +
+              `success: ${result.success}${result.error ? `, error: ${result.error}` : ''}`,
+            );
+
+            if (result.success) {
+              await updateQueueItemStatus(nextItem.identity, 'PRINTED');
+            } else {
+              await updateQueueItemStatus(nextItem.identity, 'FAILED', result.error);
+            }
           }
+        } finally {
+          queueProcessingInFlight = false;
+          console.log('[WinPrint][Queue] processQueue: finished (flag released)');
         }
       },
 
@@ -1209,7 +1454,7 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      // ── Monitoring initial state ─────────────────────────────────────────────
+      // â”€â”€ Monitoring initial state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       monitoringEnabled: false,
       fcmToken: null,
       fcmRegistrationStatus: 'unregistered',
@@ -1221,7 +1466,7 @@ export const useAppStore = create<AppStore>()(
       deferredLoadingId: null,
       deferredError: null,
 
-      // ── Monitoring actions ───────────────────────────────────────────────────
+      // â”€â”€ Monitoring actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
       enableMonitoring: () => set({ monitoringEnabled: true }),
       disableMonitoring: () => set({ monitoringEnabled: false }),
@@ -1279,12 +1524,26 @@ export const useAppStore = create<AppStore>()(
 
         const parts = entry.split('::');
         const fileId = parts[0];
-        const folderId = parts[1] || sourceFolderId || 'root';
+        // parts[1] is the Incoming folder ID embedded in the FCM notification entry.
+        // Fall back to the configured sourceFolderId only if the entry is legacy
+        // (no embedded folder). Never use 'root' â€” it is not a valid archive source.
+        const embeddedFolderId = parts[1] && parts[1] !== 'root' ? parts[1] : null;
+        const folderId = embeddedFolderId || (sourceFolderId && sourceFolderId !== 'root' ? sourceFolderId : null);
         const fileName = parts[2];
 
         if (!fileId) {
           set({ deferredError: 'Invalid deferred file entry.' });
           return false;
+        }
+
+        if (!folderId) {
+          console.warn(
+            `[WinPrint][Queue] enqueueDeferredFile: no valid Incoming folder ID for entry "${entry}". ` +
+            'Receipts will be queued but archive will not run. ' +
+            'Configure the Incoming folder in Settings > Drive.',
+          );
+          // Proceed with enqueue so printing is not blocked, but warn.
+          // prepareCsvForQueue will also guard against missing/root folderId.
         }
 
         set({ deferredLoadingId: entry, deferredError: null, driveNeedsReauth: false });
@@ -1322,13 +1581,14 @@ export const useAppStore = create<AppStore>()(
             throw new Error('The CSV contains no valid receipts.');
           }
 
-          // Enqueue receipts using existing duplicate-protection logic
-          get().prepareCsvForQueue(fileId, folderId, receipts.length);
+          // prepareCsvForQueue guards against null/empty/root folderId internally.
+          // Pass folderId ?? '' so TypeScript is satisfied; the guard rejects empty strings quietly.
+          get().prepareCsvForQueue(fileId, folderId ?? '', receipts.length);
           for (const receipt of receipts) {
             enqueueReceipt(receipt);
           }
 
-          // Successfully enqueued — remove from deferred list
+          // Successfully enqueued â€” remove from deferred list
           set({ driveAccessChecked: true, driveNeedsReauth: false });
           removeDeferredFileId(entry);
           set({ deferredLoadingId: null, deferredError: null });
@@ -1355,7 +1615,7 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      // ── Hydration initial state & actions ───────────────────────────────────
+      // â”€â”€ Hydration initial state & actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       _hasHydrated: false,
       setHasHydrated: (val: boolean) => set({ _hasHydrated: val }),
     }),
@@ -1385,6 +1645,10 @@ export const useAppStore = create<AppStore>()(
         lastReconciliationAt: state.lastReconciliationAt,
         lastMonitoringError: state.lastMonitoringError,
         deferredFileIds: state.deferredFileIds,
+
+        // Onboarding position is resumable; step completion is always derived
+        // from the real folder, profile, printer, and authorization state.
+        onboardingStep: state.onboardingStep,
       }),
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true);

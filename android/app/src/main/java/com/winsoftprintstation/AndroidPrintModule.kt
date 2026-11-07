@@ -1,6 +1,8 @@
 package com.winsoftprintstation
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
@@ -8,6 +10,8 @@ import android.print.PageRange
 import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
+import android.print.PrintJob
+import android.print.PrintJobInfo
 import android.print.PrintManager
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -103,8 +107,17 @@ class AndroidPrintModule(private val context: ReactApplicationContext) :
             .build()
 
           val safeJobName = if (jobName.isNotBlank()) jobName else "Winsoft Print Station Document"
-          printManager.print(safeJobName, adapter, printAttributes)
-          promise.resolve(true)
+          val printJob = printManager.print(safeJobName, adapter, printAttributes)
+          if (printJob == null) {
+            promise.reject("PRINT_REJECTED", "Android PrintManager did not create a print job.")
+            return@runOnUiThread
+          }
+
+          // PrintManager.print() only creates the job and opens the system UI.
+          // Keep the JS promise pending until Android reports a terminal state
+          // so the app cannot mark the receipt printed or archive its CSV just
+          // because the print dialog was shown.
+          awaitPrintJobCompletion(printJob, promise)
         } catch (e: Exception) {
           promise.reject("PRINT_FAILED", e.message, e)
         }
@@ -112,5 +125,30 @@ class AndroidPrintModule(private val context: ReactApplicationContext) :
     } catch (e: Exception) {
       promise.reject("PRINT_DISPATCH_FAILED", e.message, e)
     }
+  }
+
+  private fun awaitPrintJobCompletion(printJob: PrintJob, promise: Promise) {
+    val handler = Handler(Looper.getMainLooper())
+    val poll = object : Runnable {
+      override fun run() {
+        try {
+          when (printJob.info.state) {
+            PrintJobInfo.STATE_COMPLETED -> promise.resolve(true)
+            PrintJobInfo.STATE_FAILED -> promise.reject(
+              "PRINT_FAILED",
+              "Android PrintManager reported that the print job failed."
+            )
+            PrintJobInfo.STATE_CANCELED -> promise.reject(
+              "PRINT_CANCELLED",
+              "The Android print job was canceled before completion."
+            )
+            else -> handler.postDelayed(this, 500)
+          }
+        } catch (e: Exception) {
+          promise.reject("PRINT_STATUS_UNAVAILABLE", e.message, e)
+        }
+      }
+    }
+    handler.post(poll)
   }
 }

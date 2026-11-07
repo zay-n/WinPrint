@@ -1,5 +1,5 @@
 import React from 'react';
-import { FlatList, Pressable, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
+import { Alert, FlatList, Pressable, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Icon from '../../components/Icon';
 import { Colors, Spacing, BorderRadius, Typography, Shadow } from '../../theme';
@@ -10,6 +10,7 @@ export default function QueueScreen() {
   const queue = useAppStore(s => s.queue);
   const processQueue = useAppStore(s => s.processQueue);
   const retryFailedPrints = useAppStore(s => s.retryFailedPrints);
+  const cancelQueueItem = useAppStore(s => s.cancelQueueItem);
   const printLoading = useAppStore(s => s.printLoading);
   const selectedPrinterType = useAppStore(s => s.selectedPrinterType);
 
@@ -21,7 +22,7 @@ export default function QueueScreen() {
   const enqueueDeferredFile = useAppStore(s => s.enqueueDeferredFile);
   const enqueueAllDeferredFiles = useAppStore(s => s.enqueueAllDeferredFiles);
 
-  const activeQueue = queue.filter(q => q.status !== 'PRINTED');
+  const activeQueue = queue.filter(q => q.status !== 'PRINTED' && q.status !== 'CANCELLED');
   const failedCount = activeQueue.filter(q => q.status === 'FAILED').length;
   const queuedCount = activeQueue.filter(q => q.status === 'QUEUED').length;
   const deferredCount = deferredFileIds.length;
@@ -63,7 +64,7 @@ export default function QueueScreen() {
               <Icon name="printer-outline" size={18} color="#fff" />
             )}
             <Text style={styles.actionBtnText}>
-              Process Queue ({selectedPrinterType === 'office' ? 'Office' : 'Thermal'})
+              Print Items in Queue ({selectedPrinterType === 'office' ? 'Office' : 'Thermal'})
             </Text>
           </Pressable>
 
@@ -168,7 +169,7 @@ export default function QueueScreen() {
             </View>
           ) : undefined
         }
-        renderItem={({ item }) => <QueueItemRow item={item} />}
+        renderItem={({ item }) => <QueueItemRow item={item} cancelQueueItem={cancelQueueItem} />}
         ListEmptyComponent={
           <View style={styles.emptyState}>
             <Icon name="inbox-outline" size={48} color={Colors.inactive} />
@@ -187,7 +188,7 @@ export default function QueueScreen() {
   );
 }
 
-function QueueItemRow({ item }: { item: QueueItem }) {
+function QueueItemRow({ item, cancelQueueItem }: { item: QueueItem; cancelQueueItem: (identity: string) => boolean }) {
   const isFailed = item.status === 'FAILED';
   const isPrinting = item.status === 'PRINTING';
   const statusLabel = isFailed ? 'Print failed' : isPrinting ? 'Printing...' : 'Waiting to print';
@@ -220,6 +221,29 @@ function QueueItemRow({ item }: { item: QueueItem }) {
       <Text style={styles.itemDate}>
         Queued at: {new Date(item.queuedAt).toLocaleTimeString()}
       </Text>
+      {item.status === 'QUEUED' && (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Cancel receipt ${item.receipt.transactionNumber}`}
+          style={({ pressed }) => [styles.cancelQueueBtn, pressed && styles.actionBtnPressed]}
+          onPress={() => Alert.alert(
+            'Cancel queued receipt?',
+            'This receipt will be removed from the print queue. Its source CSV will remain in Incoming.',
+            [
+              { text: 'Keep queued', style: 'cancel' },
+              {
+                text: 'Cancel receipt', style: 'destructive', onPress: () => {
+                  if (!cancelQueueItem(item.identity)) {
+                    Alert.alert('Printing already started', 'Cancellation is unavailable after printing begins.');
+                  }
+                }
+              },
+            ],
+          )}>
+          <Text style={styles.cancelQueueText}>Cancel</Text>
+        </Pressable>
+      )}
+      {isPrinting && <Text style={styles.itemError}>Printing has started; cancellation is unavailable.</Text>}
     </View>
   );
 }
@@ -353,6 +377,8 @@ const styles = StyleSheet.create({
     color: Colors.textPrimary,
     fontWeight: '600',
   },
+  cancelQueueBtn: { minHeight: 48, alignSelf: 'flex-end', justifyContent: 'center', paddingHorizontal: Spacing.lg, borderRadius: BorderRadius.sm, borderWidth: 1, borderColor: Colors.borderLight, marginTop: Spacing.sm },
+  cancelQueueText: { ...Typography.bodyMedium, color: Colors.error, fontWeight: '600' },
   itemStatus: {
     ...Typography.captionMedium,
     color: Colors.textSecondary,

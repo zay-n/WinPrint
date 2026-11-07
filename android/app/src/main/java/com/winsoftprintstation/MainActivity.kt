@@ -1,7 +1,10 @@
 package com.winsoftprintstation
 
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Bundle
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
@@ -27,6 +30,11 @@ class MainActivity : ReactActivity() {
 
     override fun getMainComponentName(): String = "WinsoftPrintStation"
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        dismissPrintNotification(intent)
+    }
+
     override fun createReactActivityDelegate(): ReactActivityDelegate =
         DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
 
@@ -34,11 +42,19 @@ class MainActivity : ReactActivity() {
         super.onNewIntent(intent)
         // Replace the current intent so getInitialPrintIntent() can read it.
         setIntent(intent)
+        dismissPrintNotification(intent)
         dispatchPrintIntentIfReady(intent)
     }
 
+    private fun dismissPrintNotification(intent: Intent) {
+        if (intent.action != WinsoftFcmService.ACTION_PRINT) return
+        val fileId = intent.data?.getQueryParameter(WinsoftFcmService.EXTRA_FILE_ID) ?: return
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        manager.cancel(WinsoftFcmService.notificationId(fileId))
+    }
+
     private fun dispatchPrintIntentIfReady(intent: Intent) {
-        if (intent.action != "com.winsoftprintstation.ACTION_PRINT") return
+        if (intent.action != WinsoftFcmService.ACTION_PRINT) return
         val uri: Uri = intent.data ?: return
         val fileId = uri.getQueryParameter("fileId") ?: return
         val folderId = uri.getQueryParameter("folderId") ?: return

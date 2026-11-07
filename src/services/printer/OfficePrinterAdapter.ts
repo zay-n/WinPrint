@@ -51,20 +51,43 @@ export class OfficePrinterAdapter implements PrinterAdapter {
   }
 
   public async print(receipt: Receipt, profile?: BusinessProfile, template?: A4Template): Promise<PrintResult> {
+    const logId = `${receipt.sourceFile?.driveFileId ?? 'local'}::${receipt.transactionType}::${receipt.transactionNumber}`;
+    console.log(`[WinPrint][OfficePrinter] print() started — identity: ${logId}`);
     try {
       if (Platform.OS !== 'android' || !AndroidPrint) {
-        throw new Error('Android Print Framework is not available on this platform.');
+        const msg = 'Android Print Framework is not available on this platform.';
+        console.warn(`[WinPrint][OfficePrinter] Not available: ${msg}`);
+        throw new Error(msg);
       }
 
-      // 1. Ensure A4 PDF exists locally
+      // 1. Generate A4 PDF locally
+      console.log(`[WinPrint][OfficePrinter] Generating PDF for: ${logId}`);
       const pdfPath = await generateReceiptPdf(receipt, profile, template);
-      const jobName = `Winsoft Receipt ${receipt.transactionNumber || receipt.transactionType}`;
+      console.log(`[WinPrint][OfficePrinter] PDF ready at: ${pdfPath}`);
 
-      // 2. Send PDF to native Android Print Framework
-      await AndroidPrint.printPdf(pdfPath, jobName);
+      const jobName = receiptPdfFilename(receipt) ||
+        `Winsoft Receipt ${receipt.transactionNumber || receipt.transactionType}`;
+
+      // 2. Submit to Android PrintManager and wait for its terminal job state.
+      //
+      // Android reports COMPLETED only after its print job is marked complete;
+      // printPdf() remains pending while the dialog/job is active and rejects
+      // if the job fails or is canceled.
+      //
+      // LIMITATION: Android's completed state is the framework's success
+      // signal. The app has no sensor that can verify paper physically exited
+      // the printer.
+      console.log(`[WinPrint][OfficePrinter] Submitting job "${jobName}" to Android PrintManager`);
+      const completed: boolean = await AndroidPrint.printPdf(pdfPath, jobName);
+      if (!completed) {
+        console.warn(`[WinPrint][OfficePrinter] printPdf() resolved false — job did not complete`);
+        return {success: false, error: 'Android PrintManager did not confirm print job completion.'};
+      }
+      console.log(`[WinPrint][OfficePrinter] Android reports job completed — identity: ${logId}`);
       return {success: true};
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      console.error(`[WinPrint][OfficePrinter] print() failed — identity: ${logId}, error: ${message}`);
       return {
         success: false,
         error: `Office print failed: ${message}`,
