@@ -26,7 +26,7 @@ import {SafeAreaView} from 'react-native-safe-area-context';
 import Icon from '../../components/Icon';
 import DriveFolderPickerModal from '../../components/DriveFolderPickerModal';
 import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
-import {useAppStore} from '../../store/useAppStore';
+import {useAppStore, csvWorkflowState} from '../../store/useAppStore';
 import type {DriveFile} from '../../services/drive/DriveClient';
 import type {DriveScreenProps} from '../../navigation/types';
 
@@ -60,6 +60,18 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
 
   const downloadAndParse = useAppStore(s => s.downloadAndParse);
   const receipts = useAppStore(s => s.receipts);
+  const queue = useAppStore(s => s.queue);
+  const csvProgress = useAppStore(s => s.csvProgress);
+  const lastParsedFileId = useAppStore(s => s.lastParsedFileId);
+  const archiveFiles = useAppStore(s => s.archiveFiles);
+  const loadArchiveFiles = useAppStore(s => s.loadArchiveFiles);
+  const parsedState = lastParsedFileId
+    ? csvWorkflowState(lastParsedFileId, queue, csvProgress, lastParsedFileId)
+    : 'NEW';
+  const canEnqueue = parsedState === 'PARSED';
+  const stateLabel: Record<string, string> = {
+    PARSED: 'Parsed', QUEUED: 'Queued', PRINTING: 'Printing', PRINTED: 'Printed', ARCHIVED: 'Archived',
+  };
   const enqueueReceipt = useAppStore(s => s.enqueueReceipt);
   const parseLoading = useAppStore(s => s.parseLoading);
   const csvError = useAppStore(s => s.csvError);
@@ -72,6 +84,12 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
       void loadCsvFiles();
     }
   }, [user, sourceFolderId, loadCsvFiles]);
+
+  useEffect(() => {
+    if (user && archiveFolderId) {
+      void loadArchiveFiles();
+    }
+  }, [user, archiveFolderId, loadArchiveFiles]);
 
   const handleDownload = useCallback(
     (file: DriveFile) => {
@@ -219,6 +237,19 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
            </Pressable>
         )}
 
+        {archiveFolderId && archiveFiles.length > 0 ? (
+          <>
+            <SectionLabel title={`Printed Files (${archiveFiles.length})`} />
+            {archiveFiles.map(f => (
+              <View key={f.id} style={styles.listRow}>
+                <Icon name="check-circle-outline" size={20} color={Colors.textSecondary} />
+                <Text style={styles.listRowText} numberOfLines={1}>{f.name}</Text>
+                <Text style={styles.receiptSummaryCount}>Archived</Text>
+              </View>
+            ))}
+          </>
+        ) : null}
+
         {/* CSV files */}
         {sourceFolderId ? (
           <>
@@ -266,11 +297,15 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
                 <Text style={styles.receiptSummaryCount}>
                   {receipts.length} transaction{receipts.length !== 1 ? 's' : ''}
                 </Text>
-                <Pressable
-                  style={styles.enqueueBtn}
-                  onPress={() => receipts.forEach(r => enqueueReceipt(r))}>
-                  <Text style={styles.enqueueBtnText}>Enqueue All</Text>
-                </Pressable>
+                {canEnqueue ? (
+                  <Pressable
+                    style={styles.enqueueBtn}
+                    onPress={() => receipts.forEach(r => enqueueReceipt(r))}>
+                    <Text style={styles.enqueueBtnText}>Enqueue All</Text>
+                  </Pressable>
+                ) : (
+                  <Text style={styles.receiptSummaryCount}>{stateLabel[parsedState] ?? ''}</Text>
+                )}
               </View>
               {receipts.map((r, receiptIndex) => (
                 <Pressable

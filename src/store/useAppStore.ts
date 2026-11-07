@@ -87,6 +87,8 @@ interface DriveState {
   folders: DriveFile[];
   /** CSV files in the selected folder */
   csvFiles: DriveFile[];
+  /** CSV files in the archive (Printed) folder */
+  archiveFiles: DriveFile[];
   foldersLoading: boolean;
   csvLoading: boolean;
   driveError: string | null;
@@ -103,6 +105,9 @@ interface DriveActions {
   selectFolder: (folder: FolderSelection | DriveFile) => Promise<void>;
   selectArchiveFolder: (folder: FolderSelection | DriveFile) => void;
   loadCsvFiles: () => Promise<void>;
+  loadArchiveFiles: () => Promise<void>;
+  /** Refresh Incoming + Printed listings (after a successful archive). */
+  refreshDriveListings: () => Promise<void>;
   validateSavedFolders: () => Promise<void>;
 }
 
@@ -196,6 +201,8 @@ interface QueueActions {
   updateQueueItemStatus: (identity: string, status: PrintStatus, error?: string) => Promise<void>;
   retryFailedPrints: () => void;
   retryArchive: (driveFileId: string) => Promise<void>;
+  /** Clear stale parsed state + refresh listings after a CSV is archived. */
+  onCsvArchived: (driveFileId: string) => void;
   clearHistory: () => void;
   processQueue: () => Promise<void>;
 }
@@ -437,6 +444,7 @@ export const useAppStore = create<AppStore>()(
           // are preserved across sessions so re-signing in does not wipe them.
           folders: [],
           csvFiles: [],
+          archiveFiles: [],
           receipts: [],
           lastParsedFileId: null,
           generatedPdfPaths: {},
@@ -479,6 +487,7 @@ export const useAppStore = create<AppStore>()(
       archiveFolderValid: true,
       folders: [],
       csvFiles: [],
+      archiveFiles: [],
       foldersLoading: false,
       csvLoading: false,
       driveError: null,
@@ -596,7 +605,10 @@ export const useAppStore = create<AppStore>()(
         }
         set({csvLoading: true, driveError: null});
         try {
-          const csvFiles = await DriveService.listCsvFiles(accessToken, sourceFolderId);
+          const listed = await DriveService.listCsvFiles(accessToken, sourceFolderId);
+          const progress = get().csvProgress;
+          // Never show an already-archived CSV as incoming (stale listing guard)
+          const csvFiles = listed.filter(f => progress[f.id]?.archiveStatus !== 'ARCHIVED');
           set({csvFiles, csvLoading: false});
         } catch (e: unknown) {
           const err = e as {message?: string};
@@ -605,6 +617,22 @@ export const useAppStore = create<AppStore>()(
             driveError: err?.message ?? 'Failed to list CSV files.',
           });
         }
+      },
+
+      loadArchiveFiles: async () => {
+        const {accessToken, archiveFolderId} = get();
+        if (!accessToken || !archiveFolderId) return;
+        try {
+          const archiveFiles = await DriveService.listCsvFiles(accessToken, archiveFolderId);
+          set({archiveFiles});
+        } catch (e: unknown) {
+          const err = e as {message?: string};
+          set({driveError: err?.message ?? 'Failed to list printed CSV files.'});
+        }
+      },
+
+      refreshDriveListings: async () => {
+        await Promise.all([get().loadCsvFiles(), get().loadArchiveFiles()]);
       },
 
       // ── CSV initial state ───────────────────────────────────────────────────
@@ -619,6 +647,10 @@ export const useAppStore = create<AppStore>()(
         const {accessToken, sourceFolderId} = get();
         if (!accessToken) {
           set({csvError: 'Not signed in.'});
+          return;
+        }
+        if (get().csvProgress[file.id]?.archiveStatus === 'ARCHIVED') {
+          set({csvError: 'This CSV was already printed and archived.'});
           return;
         }
         set({parseLoading: true, csvError: null});
@@ -822,7 +854,11 @@ export const useAppStore = create<AppStore>()(
 
       enqueueReceipt: (receipt: Receipt) => {
         const identity = receiptIdentity(receipt);
-        const { queue } = get();
+        const { queue, csvProgress } = get();
+        const srcId = receipt.sourceFile?.driveFileId;
+        if (srcId && csvProgress[srcId]?.archiveStatus === 'ARCHIVED') {
+          return; // CSV already printed + archived: never re-enqueue
+        }
         const existing = queue.find(q => q.identity === identity);
         if (existing && (existing.status === 'QUEUED' || existing.status === 'PRINTING' || existing.status === 'PRINTED')) {
           return; // Duplicate protection
@@ -892,6 +928,21 @@ export const useAppStore = create<AppStore>()(
         }
 
         set({ queue: newQueue, csvProgress: newCsvProgress });
+
+        const dfId = item.receipt.sourceFile?.driveFileId;
+        if (dfId && csvProgress[dfId]?.archiveStatus !== 'ARCHIVED' && newCsvProgress[dfId]?.archiveStatus === 'ARCHIVED') {
+          get().onCsvArchived(dfId);
+        }
+      },
+
+      onCsvArchived: (driveFileId: string) => {
+        set(state => ({
+          csvFiles: state.csvFiles.filter(f => f.id !== driveFileId),
+          ...(state.lastParsedFileId === driveFileId
+            ? {receipts: [], lastParsedFileId: null, generatedPdfPaths: {}, pdfError: null}
+            : {}),
+        }));
+        void get().refreshDriveListings();
       },
 
       retryFailedPrints: () => {
@@ -931,6 +982,7 @@ export const useAppStore = create<AppStore>()(
                  [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'ARCHIVED', archiveError: undefined }
                }
             }));
+            get().onCsvArchived(driveFileId);
          } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
             set(state => ({
@@ -1161,4 +1213,24 @@ export const useAppStore = create<AppStore>()(
 
 export function receiptIdentity(receipt: Receipt): string {
   return `${receipt.sourceFile?.driveFileId ?? 'local'}::${receipt.transactionType}::${receipt.transactionNumber}`;
+}
+
+export type CsvWorkflowState = 'NEW' | 'PARSED' | 'QUEUED' | 'PRINTING' | 'PRINTED' | 'ARCHIVED';
+
+/** Derive a CSV's workflow state from real queue/archive state (not stale local UI state). */
+export function csvWorkflowState(
+  fileId: string,
+  queue: QueueItem[],
+  csvProgress: Record<string, CsvProgress>,
+  parsedFileId: string | null,
+): CsvWorkflowState {
+  const prog = csvProgress[fileId];
+  if (prog?.archiveStatus === 'ARCHIVED') return 'ARCHIVED';
+  const items = queue.filter(q => q.receipt.sourceFile?.driveFileId === fileId);
+  if (items.length > 0) {
+    if (items.some(q => q.status === 'PRINTING')) return 'PRINTING';
+    if (items.some(q => q.status === 'QUEUED' || q.status === 'FAILED')) return 'QUEUED';
+    if (items.every(q => q.status === 'PRINTED')) return 'PRINTED';
+  }
+  return parsedFileId === fileId ? 'PARSED' : 'NEW';
 }
