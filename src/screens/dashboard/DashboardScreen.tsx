@@ -169,15 +169,11 @@ export default function DashboardScreen() {
     {label: 'Account approved and assigned', done: authProfile?.status === 'active' && !!authProfile.businessId && customer?.status === 'active', action: undefined as (() => void) | undefined},
     {label: 'Incoming folder selected', done: !!sourceFolderId, action: () => navigation.navigate('Drive')},
     {label: 'Printed/archive folder selected', done: !!archiveFolderId && archiveFolderId !== sourceFolderId, action: () => navigation.navigate('Drive')},
-    {label: 'Notifications allowed and device registered', done: fcmRegistrationStatus === 'registered' && (notificationPermission === 'granted' || notificationPermission === 'checking'), action: () => navigation.navigate('Settings')},
-    {label: 'Business profile reviewed', done: !!businessProfile.identity.businessName.trim() && !!businessProfile.contact.addressLine1.trim() && !!businessProfile.contact.phone.trim(), action: () => navigation.navigate('Settings', {screen: 'BusinessSetup'} as never)},
+    {label: 'Notifications allowed and device registered', done: fcmRegistrationStatus === 'registered' && notificationPermission === 'granted', action: () => navigation.navigate('Settings')},
+    {label: 'Business profile reviewed', done: !!businessProfile.identity.businessName.trim(), action: () => navigation.navigate('Settings', {screen: 'BusinessSetup'} as never)},
     {label: 'Printer selected', done: printerReady, action: () => navigation.navigate('Settings')},
     {label: 'Incoming folder shared with monitoring backend', done: fcmRegistrationStatus === 'registered' && !!serviceAccountEmail, action: () => navigation.navigate('Settings')},
-    {label: 'Monitoring enabled when ready', done: monitoringEnabled, action: () => navigation.navigate('Settings')},
   ];
-  const onboardingReady = onboardingSteps.slice(0, 7).every(step => step.done);
-  onboardingSteps[7].done = monitoringEnabled && onboardingReady;
-  if (!onboardingReady) onboardingSteps[7].action = undefined;
   // Monitoring can remain intentionally off for an otherwise configured
   // existing installation; only missing setup configuration keeps this guide visible.
   const needsOnboarding = onboardingSteps.slice(0, 7).some(step => !step.done);
@@ -217,23 +213,26 @@ export default function DashboardScreen() {
 
         {needsOnboarding && (
           <View style={styles.setupCard}>
-            <Text style={styles.setupTitle}>Welcome — finish your setup</Text>
-            <Text style={styles.setupDescription}>Signed in as {user?.email || 'your approved account'}. Complete these checks to prepare Drive, notifications, your business profile, and printer.</Text>
-            {onboardingSteps.map((step, index) => (
-              <View key={step.label} style={styles.setupRow}>
-                <Icon name={step.done ? 'check-circle' : 'circle-outline'} size={17} color={step.done ? Colors.active : Colors.textTertiary} />
-                <Text style={[styles.setupStepText, step.done && styles.setupStepDone]}>{index + 1}. {step.label}</Text>
-                {!step.done && step.action && <Pressable onPress={step.action} accessibilityRole="button"><Text style={styles.setupAction}>Open</Text></Pressable>}
+            <View style={styles.setupHeader}>
+              <View style={styles.setupIcon}>
+                <Icon name="printer-wireless" size={22} color={Colors.primaryLight} />
               </View>
-            ))}
-            <Text style={styles.setupNote}>
-              {serviceAccountEmail
-                ? `Monitoring service account: ${serviceAccountEmail}. Backend access is confirmed only when device registration succeeds.`
-                : 'The actual monitoring service-account email is returned by registerdevice after an Incoming folder is selected. It is not embedded in the app.'}
-            </Text>
-            {serviceAccountEmail && <Pressable onPress={() => void MonitoringService.copyToClipboard(serviceAccountEmail)}><Text style={styles.setupAction}>Copy service account email</Text></Pressable>}
-            <Text style={styles.setupNote}>The monitoring backend watches the Incoming folder. The Printed/archive folder is moved by this app using your Google Drive account; it does not need to be shared with the backend service account.</Text>
-            <Text style={styles.setupNote}>{onboardingReady ? 'Setup checks are ready. Enable Monitoring explicitly in Settings when you are ready.' : 'Monitoring stays off until account authorization, folder selection, notification registration, business information, and printer setup checks are complete.'}</Text>
+              <View style={styles.setupCopy}>
+                <Text style={styles.setupTitle}>Finish setting up Print Station</Text>
+                <Text style={styles.setupDescription}>
+                  {user?.email || 'Your approved account'} · {onboardingSteps.slice(0, 7).filter(item => !item.done).length} setup items to review
+                </Text>
+              </View>
+            </View>
+            <Text style={styles.setupNote}>Choose folders, review your receipt details, and prepare a printer. Monitoring stays an explicit choice in Settings.</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Continue guided setup"
+              onPress={() => navigation.navigate('Onboarding')}
+              style={({pressed}) => [styles.setupButton, pressed && {opacity: 0.82}]}>
+              <Text style={styles.setupButtonText}>Continue setup</Text>
+              <Icon name="chevron-right" size={18} color="#FFFFFF" />
+            </Pressable>
           </View>
         )}
 
@@ -571,9 +570,14 @@ const styles = StyleSheet.create({
     color: Colors.primary,
     fontWeight: '700',
   },
-  setupCard: { backgroundColor: Colors.surface, borderRadius: BorderRadius.md, borderWidth: 1, borderColor: `${Colors.primary}55`, padding: Spacing.md, gap: Spacing.sm, ...Shadow.sm },
+  setupCard: { backgroundColor: Colors.surface, borderRadius: BorderRadius.lg, borderWidth: 1, borderColor: `${Colors.primary}55`, padding: Spacing.base, gap: Spacing.md, ...Shadow.sm },
+  setupHeader: { flexDirection: 'row', alignItems: 'center', gap: Spacing.md },
+  setupIcon: { width: 48, height: 48, borderRadius: BorderRadius.md, alignItems: 'center', justifyContent: 'center', backgroundColor: `${Colors.primary}22` },
+  setupCopy: { flex: 1, gap: Spacing.xxs },
   setupTitle: { ...Typography.bodyMedium, color: Colors.textPrimary, fontWeight: '700' },
   setupDescription: { ...Typography.caption, color: Colors.textSecondary, lineHeight: 19 },
+  setupButton: { minHeight: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: Spacing.sm, paddingHorizontal: Spacing.base, borderRadius: BorderRadius.md, backgroundColor: Colors.primary },
+  setupButtonText: { ...Typography.bodyMedium, color: '#FFFFFF', fontWeight: '700' },
   setupRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.xs },
   setupStepText: { ...Typography.caption, color: Colors.textSecondary, flex: 1 },
   setupStepDone: { color: Colors.active },

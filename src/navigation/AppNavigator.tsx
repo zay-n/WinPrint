@@ -31,6 +31,7 @@ import HistoryScreen from '../screens/history/HistoryScreen';
 import SettingsScreen from '../screens/settings/SettingsScreen';
 import AdminScreen from '../screens/settings/AdminScreen';
 import BusinessSetupScreen from '../screens/settings/BusinessSetupScreen';
+import OnboardingScreen from '../screens/onboarding/OnboardingScreen';
 
 // ─── Stack navigators (one per tab — ready for future nested screens) ─────────
 
@@ -46,6 +47,11 @@ function DashboardNavigator() {
       <DashboardStack.Screen
         name="DashboardHome"
         component={DashboardScreen}
+        options={{headerShown: false}}
+      />
+      <DashboardStack.Screen
+        name="Onboarding"
+        component={OnboardingScreen}
         options={{headerShown: false}}
       />
     </DashboardStack.Navigator>

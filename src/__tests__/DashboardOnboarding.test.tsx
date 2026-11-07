@@ -30,8 +30,8 @@ describe('Dashboard first-time setup guide', () => {
     await ReactTestRenderer.act(async () => {
       renderer = ReactTestRenderer.create(<DashboardScreen />);
     });
-    expect(renderer.root.findAll(node => node.type === Text && node.props.children === 'Welcome — finish your setup')).toHaveLength(1);
-    expect(renderer.root.findAll(node => node.type === Text && String(node.props.children).includes('Incoming folder selected'))).toHaveLength(1);
+    expect(renderer.root.findAll(node => node.type === Text && node.props.children === 'Finish setting up Print Station')).toHaveLength(1);
+    expect(renderer.root.findAll(node => node.type === Text && node.props.children === 'Continue setup')).toHaveLength(1);
     await ReactTestRenderer.act(async () => renderer.unmount());
   });
 

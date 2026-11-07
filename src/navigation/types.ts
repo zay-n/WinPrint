@@ -23,7 +23,16 @@ export type RootTabParamList = {
 
 export type DashboardStackParamList = {
   DashboardHome: undefined;
+  Onboarding: undefined;
 };
+
+export type DashboardStackScreenProps<Screen extends keyof DashboardStackParamList> =
+  NativeStackScreenProps<DashboardStackParamList, Screen>;
+
+export type OnboardingScreenProps = CompositeScreenProps<
+  NativeStackScreenProps<DashboardStackParamList, 'Onboarding'>,
+  BottomTabScreenProps<RootTabParamList>
+>;
 
 export type DriveStackParamList = {
   DriveHome: undefined;

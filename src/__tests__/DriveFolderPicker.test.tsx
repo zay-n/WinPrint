@@ -19,7 +19,7 @@ jest.mock('../services/drive/DriveService', () => ({
 }));
 
 describe('DriveFolderPickerModal', () => {
-  let tree: renderer.ReactTestRenderer | null = null;
+  let tree: any = null;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -76,8 +76,6 @@ describe('DriveFolderPickerModal', () => {
 
     const onSelect = jest.fn();
     const onClose = jest.fn();
-
-    let tree: any = null;
     await act(async () => {
       tree = renderer.create(
         <DriveFolderPickerModal
@@ -164,8 +162,6 @@ describe('DriveFolderPickerModal', () => {
 
     const onSelect = jest.fn();
     const onClose = jest.fn();
-
-    let tree: any = null;
     await act(async () => {
       tree = renderer.create(
         <DriveFolderPickerModal
