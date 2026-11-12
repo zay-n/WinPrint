@@ -178,7 +178,7 @@ export default function QueueScreen() {
             <Text style={styles.emptyDesc}>
               {deferredCount > 0
                 ? 'Tap "Enqueue" on a deferred bill above to prepare it for printing.'
-                : 'Parse a CSV and enqueue transactions to print.'}
+                : 'Tap Process CSV on the Drive tab to add receipts here.'}
             </Text>
           </View>
         }

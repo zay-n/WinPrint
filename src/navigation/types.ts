@@ -34,6 +34,8 @@ export type DriveStackParamList = {
     receiptIndex: number;
     pdfPath: string;
   };
+  /** Stored (queued/printed) receipt, looked up by identity. */
+  QueuedReceipt: {identity: string};
 };
 
 export type QueueStackParamList = {
@@ -42,6 +44,7 @@ export type QueueStackParamList = {
 
 export type HistoryStackParamList = {
   HistoryHome: undefined;
+  HistoryDetail: {identity: string};
 };
 
 export type SettingsStackParamList = {
