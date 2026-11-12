@@ -5,8 +5,9 @@ import Icon from '../../components/Icon';
 import { Colors, Spacing, BorderRadius, Typography, Shadow } from '../../theme';
 import { useAppStore } from '../../store/useAppStore';
 import type { QueueItem, CsvProgress } from '../../store/useAppStore';
+import type { HistoryScreenProps } from '../../navigation/types';
 
-export default function HistoryScreen() {
+export default function HistoryScreen({ navigation }: HistoryScreenProps) {
   const queue = useAppStore(s => s.queue);
   const csvProgress = useAppStore(s => s.csvProgress);
   const reprintHistory = useAppStore(s => s.reprintHistory);
@@ -56,7 +57,13 @@ export default function HistoryScreen() {
           data={printedItems}
           keyExtractor={item => item.identity}
           contentContainerStyle={styles.listContent}
-          renderItem={({ item }) => <HistoryItemRow item={item} attempts={reprintHistory.filter(attempt => attempt.identity === item.identity)} />}
+          renderItem={({ item }) => (
+            <HistoryItemRow
+              item={item}
+              attempts={reprintHistory.filter(attempt => attempt.identity === item.identity)}
+              onOpen={() => navigation.navigate('HistoryDetail', { identity: item.identity })}
+            />
+          )}
           ListEmptyComponent={
             <View style={styles.emptyState}>
               <Icon name="history" size={48} color={Colors.inactive} />
@@ -84,7 +91,7 @@ export default function HistoryScreen() {
   );
 }
 
-function HistoryItemRow({ item, attempts }: { item: QueueItem; attempts: {attemptedAt: number; success: boolean; error?: string}[] }) {
+function HistoryItemRow({ item, attempts, onOpen }: { item: QueueItem; attempts: {attemptedAt: number; success: boolean; error?: string}[]; onOpen: () => void }) {
   const reprintReceipt = useAppStore(s => s.reprintReceipt);
   const [printing, setPrinting] = React.useState(false);
   const printedAt = item.completedAt
@@ -95,6 +102,12 @@ function HistoryItemRow({ item, attempts }: { item: QueueItem; attempts: {attemp
 
   return (
     <View style={styles.itemCard}>
+      {/* Viewing details is separate from Reprint and never prints. */}
+      <Pressable
+        onPress={onOpen}
+        style={({ pressed }) => pressed && styles.pressed}
+        accessibilityRole="button"
+        accessibilityLabel={`View details for ${item.receipt.transactionType} ${item.receipt.transactionNumber}`}>
       <View style={styles.itemHeader}>
         <View style={styles.itemTitleRow}>
           <Icon name="check-circle" size={18} color={Colors.active} />
@@ -110,13 +123,13 @@ function HistoryItemRow({ item, attempts }: { item: QueueItem; attempts: {attemp
         <View style={styles.itemMetaRow}>
           <Icon name="account-outline" size={13} color={Colors.textTertiary} />
           <Text style={styles.itemMetaText}>
-            {item.receipt.customer.name || 'N/A'}
+            {item.receipt.customer?.name || 'N/A'}
           </Text>
         </View>
         <View style={styles.itemMetaRow}>
           <Icon name="currency-usd" size={13} color={Colors.textTertiary} />
           <Text style={styles.itemMetaText}>
-            {item.receipt.financials.total}
+            {item.receipt.financials?.total ?? '—'}
           </Text>
         </View>
       </View>
@@ -128,6 +141,11 @@ function HistoryItemRow({ item, attempts }: { item: QueueItem; attempts: {attemp
           Reprints: {attempts.length} · Latest {attempts[attempts.length - 1].success ? 'succeeded' : 'failed'} ({new Date(attempts[attempts.length - 1].attemptedAt).toLocaleString()})
         </Text>
       )}
+      <View style={styles.viewDetailsRow}>
+        <Text style={styles.viewDetailsText}>View details</Text>
+        <Icon name="chevron-right" size={16} color={Colors.primaryLight} />
+      </View>
+      </Pressable>
       <Pressable
         style={({ pressed }) => [styles.retryBtn, pressed && styles.pressed, printing && { opacity: 0.6 }]}
         disabled={printing}
@@ -135,7 +153,7 @@ function HistoryItemRow({ item, attempts }: { item: QueueItem; attempts: {attemp
         accessibilityLabel={`Reprint ${item.receipt.transactionType} ${item.receipt.transactionNumber}`}
         onPress={() => Alert.alert(
           'Reprint receipt?',
-          `${item.receipt.transactionType} ${item.receipt.transactionNumber}${item.receipt.customer.name ? ` for ${item.receipt.customer.name}` : ''}`,
+          `${item.receipt.transactionType} ${item.receipt.transactionNumber}${item.receipt.customer?.name ? ` for ${item.receipt.customer.name}` : ''}`,
           [
             { text: 'Cancel', style: 'cancel' },
             { text: 'Reprint', onPress: async () => {
@@ -323,6 +341,16 @@ const styles = StyleSheet.create({
     color: Colors.textTertiary,
     fontSize: 10,
     marginTop: Spacing.xs,
+  },
+  viewDetailsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xxs,
+    marginTop: Spacing.xs,
+  },
+  viewDetailsText: {
+    ...Typography.captionMedium,
+    color: Colors.primaryLight,
   },
   printedBadge: {
     backgroundColor: `${Colors.active}18`,

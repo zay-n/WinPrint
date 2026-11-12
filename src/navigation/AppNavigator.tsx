@@ -28,6 +28,7 @@ import TransactionDetailScreen from '../screens/drive/TransactionDetailScreen';
 import ReceiptPreviewScreen from '../screens/drive/ReceiptPreviewScreen';
 import QueueScreen from '../screens/queue/QueueScreen';
 import HistoryScreen from '../screens/history/HistoryScreen';
+import ReceiptDetailScreen from '../screens/history/ReceiptDetailScreen';
 import SettingsScreen from '../screens/settings/SettingsScreen';
 import AdminScreen from '../screens/settings/AdminScreen';
 import BusinessSetupScreen from '../screens/settings/BusinessSetupScreen';
@@ -73,7 +74,7 @@ function DriveNavigator() {
         name="TransactionDetail"
         component={TransactionDetailScreen}
         options={{
-          title: 'Parsed Transaction',
+          title: 'Transaction Details',
           ...headerOptions,
         }}
       />
@@ -82,6 +83,14 @@ function DriveNavigator() {
         component={ReceiptPreviewScreen}
         options={{
           title: 'Receipt Preview',
+          ...headerOptions,
+        }}
+      />
+      <DriveStack.Screen
+        name="QueuedReceipt"
+        component={ReceiptDetailScreen}
+        options={{
+          title: 'Transaction Details',
           ...headerOptions,
         }}
       />
@@ -112,6 +121,14 @@ function HistoryNavigator() {
         component={HistoryScreen}
         options={{
           title: 'History',
+          ...headerOptions,
+        }}
+      />
+      <HistoryStack.Screen
+        name="HistoryDetail"
+        component={ReceiptDetailScreen}
+        options={{
+          title: 'Transaction Details',
           ...headerOptions,
         }}
       />
