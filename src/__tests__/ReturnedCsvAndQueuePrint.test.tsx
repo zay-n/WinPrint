@@ -6,7 +6,7 @@
  *     recovery of a receipt left in PRINTING by an app restart.
  */
 import React from 'react';
-import {Text} from 'react-native';
+import {Alert, Text} from 'react-native';
 import renderer, {act} from 'react-test-renderer';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import DriveScreen from '../screens/drive/DriveScreen';
@@ -235,8 +235,8 @@ describe('Issue 2 — queued receipts print only through the explicit print acti
     expect(st().queue[0].status).toBe('PRINTED');
   });
 
-  it('Drive tab: Print Now is the explicit action and runs the existing queue processor', async () => {
-    const processQueue = jest.fn(async () => {});
+  it('Drive tab: printing a file is explicit, confirmed, and limited to that file', async () => {
+    const processQueue = jest.fn(async (_ids?: string[]) => {});
     useAppStore.setState({processQueue, csvFiles: [file]});
     (DriveService.listCsvFiles as jest.Mock).mockImplementation(async folder => (folder === 'src' ? [file] : []));
     prime(2);
@@ -246,10 +246,20 @@ describe('Issue 2 — queued receipts print only through the explicit print acti
       await flush();
     });
     expect(processQueue).not.toHaveBeenCalled();
-    expect(texts(tree)).toContain('Added to the print queue. Not printed yet — tap Print Now.');
-    const btn = tree.root.findByProps({accessibilityLabel: 'Print queued receipts now'});
+    // another file's receipt is also waiting in the queue
+    await act(async () => {
+      st().enqueueReceipt({...rcpt('9', 'other'), sourceFile: {driveFileId: 'other', driveFileName: 'other.csv'}});
+      await flush();
+    });
+    expect(texts(tree)).toContain('Print These (2)');
+    const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
+    const btn = tree.root.findByProps({accessibilityLabel: 'Print receipts from sales.csv'});
     act(() => btn.props.onPress());
+    expect(processQueue).not.toHaveBeenCalled(); // waits for confirmation
+    act(() => alert.mock.calls[0][2]![1].onPress!());
     expect(processQueue).toHaveBeenCalledTimes(1);
+    expect(processQueue).toHaveBeenCalledWith(['f1::INVOICE::1', 'f1::INVOICE::2']);
+    alert.mockRestore();
     act(() => tree.unmount());
   });
 });

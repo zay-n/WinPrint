@@ -42,7 +42,17 @@ export default function App() {
         return state.queue.some(item => item.receipt.sourceFile?.driveFileId === fileId) ||
           !!progress && progress.printedCount >= progress.expectedCount && progress.expectedCount > 0;
       },
-      processQueue: () => useAppStore.getState().processQueue(),
+      processQueue: (driveFileId?: string) => {
+        const state = useAppStore.getState();
+        return state.processQueue(
+          driveFileId
+            ? state.queue
+              .filter(item => item.receipt.sourceFile?.driveFileId === driveFileId)
+              .map(item => item.identity)
+            : undefined,
+        );
+      },
+      setIncomingFiles: (files: import('./src/services/drive/DriveClient').DriveFile[]) => useAppStore.getState().setCsvFiles(files),
       setFcmToken: (t: string) => useAppStore.getState().setFcmToken(t),
       setFcmRegistrationStatus: (s: import('./src/store/useAppStore').FcmRegistrationStatus) => useAppStore.getState().setFcmRegistrationStatus(s),
       setServiceAccountEmail: (e: string) => useAppStore.getState().setServiceAccountEmail(e),

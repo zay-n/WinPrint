@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Alert, FlatList, Pressable, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Icon from '../../components/Icon';
+import Checkbox from '../../components/Checkbox';
 import { Colors, Spacing, BorderRadius, Typography, Shadow } from '../../theme';
 import { useAppStore } from '../../store/useAppStore';
 import type { QueueItem } from '../../store/useAppStore';
@@ -26,6 +27,53 @@ export default function QueueScreen() {
   const failedCount = activeQueue.filter(q => q.status === 'FAILED').length;
   const queuedCount = activeQueue.filter(q => q.status === 'QUEUED').length;
   const deferredCount = deferredFileIds.length;
+
+  // ── Receipt selection (only receipts waiting to print can be selected) ──
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const queuedIds = activeQueue.filter(q => q.status === 'QUEUED').map(q => q.identity);
+  const selectedIds = queuedIds.filter(id => selected.has(id));
+  const allSelected = queuedIds.length > 0 && selectedIds.length === queuedIds.length;
+  // One print run at a time: no second job while anything is printing.
+  const printBusy = printLoading || queue.some(q => q.status === 'PRINTING');
+
+  const toggle = (identity: string) =>
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(identity)) next.delete(identity); else next.add(identity);
+      return next;
+    });
+  const toggleAll = () => setSelected(allSelected ? new Set() : new Set(queuedIds));
+
+  const plural = (n: number) => `${n} receipt${n === 1 ? '' : 's'}`;
+  const printerLabel = selectedPrinterType === 'office' ? 'Office' : 'Thermal';
+
+  const confirmPrint = (ids: string[], title: string) => {
+    if (printBusy) return;
+    if (ids.length === 0) {
+      Alert.alert('No receipts selected', 'Tick the receipts you want to print, or use Print All.');
+      return;
+    }
+    Alert.alert(title, `${plural(ids.length)} will be sent to the ${printerLabel} printer, one after another.`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Print', onPress: () => {
+          setSelected(new Set());
+          void processQueue(ids);
+        },
+      },
+    ]);
+  };
+
+  const printOne = (identity: string) => {
+    if (printBusy) return;
+    void processQueue([identity]);
+  };
+
+  const retryOne = (identity: string) => {
+    if (printBusy) return;
+    retryFailedPrints([identity]);
+    void processQueue([identity]);
+  };
 
   return (
     <SafeAreaView style={styles.safe} edges={['bottom']}>
@@ -53,26 +101,51 @@ export default function QueueScreen() {
           <Pressable
             style={({ pressed }) => [
               styles.actionBtn,
-              (queuedCount === 0 || printLoading) && styles.actionBtnDisabled,
+              (selectedIds.length === 0 || printBusy) && styles.actionBtnDisabled,
               pressed && styles.actionBtnPressed,
             ]}
-            disabled={queuedCount === 0 || printLoading}
-            onPress={processQueue}>
-            {printLoading ? (
+            disabled={printBusy}
+            accessibilityRole="button"
+            accessibilityLabel={`Print Selected (${selectedIds.length})`}
+            onPress={() => confirmPrint(selectedIds, 'Print selected receipts?')}>
+            {printBusy ? (
               <ActivityIndicator color="#fff" size="small" />
             ) : (
               <Icon name="printer-outline" size={18} color="#fff" />
             )}
             <Text style={styles.actionBtnText}>
-              Print Items in Queue ({selectedPrinterType === 'office' ? 'Office' : 'Thermal'})
+              {printBusy ? 'Printing…' : `Print Selected (${selectedIds.length})`}
             </Text>
           </Pressable>
 
+          <Pressable
+            style={({ pressed }) => [
+              styles.printAllBtn,
+              (queuedCount === 0 || printBusy) && styles.outlineDisabled,
+              pressed && styles.actionBtnPressed,
+            ]}
+            disabled={queuedCount === 0 || printBusy}
+            accessibilityRole="button"
+            accessibilityLabel={`Print All (${queuedCount})`}
+            onPress={() => confirmPrint(queuedIds, 'Print all waiting receipts?')}>
+            <Text style={styles.printAllText}>Print All ({queuedCount})</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.selectionRow}>
+          {queuedIds.length > 0 ? (
+            <Pressable onPress={toggleAll} hitSlop={8} accessibilityRole="button">
+              <Text style={styles.selectAllText}>{allSelected ? 'Deselect All' : 'Select All'}</Text>
+            </Pressable>
+          ) : <View />}
+          <Text style={styles.selectionCount}>
+            {selectedIds.length} of {queuedIds.length} selected · {printerLabel} printer
+          </Text>
           {failedCount > 0 && (
             <Pressable
               style={({ pressed }) => [styles.retryBtn, pressed && styles.actionBtnPressed]}
-              onPress={retryFailedPrints}>
-              <Icon name="refresh" size={18} color={Colors.error} />
+              accessibilityRole="button"
+              onPress={() => retryFailedPrints()}>
               <Text style={styles.retryBtnText}>Retry Failed</Text>
             </Pressable>
           )}
@@ -169,7 +242,17 @@ export default function QueueScreen() {
             </View>
           ) : undefined
         }
-        renderItem={({ item }) => <QueueItemRow item={item} cancelQueueItem={cancelQueueItem} />}
+        renderItem={({ item }) => (
+          <QueueItemRow
+            item={item}
+            cancelQueueItem={cancelQueueItem}
+            selected={selected.has(item.identity)}
+            onToggle={() => toggle(item.identity)}
+            onPrint={() => printOne(item.identity)}
+            onRetry={() => retryOne(item.identity)}
+            printBusy={printBusy}
+          />
+        )}
         ListEmptyComponent={
           <View style={styles.emptyState}>
             <Icon name="inbox-outline" size={48} color={Colors.inactive} />
@@ -188,7 +271,18 @@ export default function QueueScreen() {
   );
 }
 
-function QueueItemRow({ item, cancelQueueItem }: { item: QueueItem; cancelQueueItem: (identity: string) => boolean }) {
+function QueueItemRow({
+  item, cancelQueueItem, selected, onToggle, onPrint, onRetry, printBusy,
+}: {
+  item: QueueItem;
+  cancelQueueItem: (identity: string) => boolean;
+  selected: boolean;
+  onToggle: () => void;
+  onPrint: () => void;
+  onRetry: () => void;
+  printBusy: boolean;
+}) {
+  const isQueued = item.status === 'QUEUED';
   const isFailed = item.status === 'FAILED';
   const isPrinting = item.status === 'PRINTING';
   const statusLabel = isFailed ? 'Print failed' : isPrinting ? 'Printing...' : 'Waiting to print';
@@ -198,11 +292,19 @@ function QueueItemRow({ item, cancelQueueItem }: { item: QueueItem; cancelQueueI
     <View style={[styles.itemCard, isFailed && styles.itemCardFailed, isPrinting && styles.itemCardPrinting]}>
       <View style={styles.itemHeader}>
         <View style={styles.itemTitleRow}>
-          <Icon
-            name={isFailed ? 'alert-circle' : isPrinting ? 'printer-sync' : 'clock-outline'}
-            size={18}
-            color={isFailed ? Colors.error : isPrinting ? Colors.active : Colors.textSecondary}
-          />
+          {isQueued ? (
+            <Checkbox
+              checked={selected}
+              onToggle={onToggle}
+              label={`Select receipt ${item.receipt.transactionType} ${item.receipt.transactionNumber}`}
+            />
+          ) : (
+            <Icon
+              name={isFailed ? 'alert-circle-outline' : 'printer-outline'}
+              size={18}
+              color={isFailed ? Colors.error : Colors.active}
+            />
+          )}
           <Text style={styles.itemTitle}>
             {item.receipt.transactionType} {item.receipt.transactionNumber}
           </Text>
@@ -212,8 +314,8 @@ function QueueItemRow({ item, cancelQueueItem }: { item: QueueItem; cancelQueueI
         </Text>
       </View>
       <Text style={styles.itemDetails}>
-        Customer: {item.receipt.customer.name || 'N/A'} {'\n'}
-        Amount: {item.receipt.financials.total}
+        Customer: {item.receipt.customer?.name || 'N/A'} {'\n'}
+        Amount: {item.receipt.financials?.total ?? '—'}
       </Text>
       {item.error ? (
         <Text style={styles.itemError}>{item.error}</Text>
@@ -221,27 +323,51 @@ function QueueItemRow({ item, cancelQueueItem }: { item: QueueItem; cancelQueueI
       <Text style={styles.itemDate}>
         Queued at: {new Date(item.queuedAt).toLocaleTimeString()}
       </Text>
-      {item.status === 'QUEUED' && (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={`Cancel receipt ${item.receipt.transactionNumber}`}
-          style={({ pressed }) => [styles.cancelQueueBtn, pressed && styles.actionBtnPressed]}
-          onPress={() => Alert.alert(
-            'Cancel queued receipt?',
-            'This receipt will be removed from the print queue. Its source CSV will remain in Incoming.',
-            [
-              { text: 'Keep queued', style: 'cancel' },
-              {
-                text: 'Cancel receipt', style: 'destructive', onPress: () => {
-                  if (!cancelQueueItem(item.identity)) {
-                    Alert.alert('Printing already started', 'Cancellation is unavailable after printing begins.');
+      {isQueued && (
+        <View style={styles.rowActions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Cancel receipt ${item.receipt.transactionNumber}`}
+            style={({ pressed }) => [styles.cancelQueueBtn, pressed && styles.actionBtnPressed]}
+            onPress={() => Alert.alert(
+              'Cancel queued receipt?',
+              'This receipt will be removed from the print queue. Its source CSV will remain in Incoming.',
+              [
+                { text: 'Keep queued', style: 'cancel' },
+                {
+                  text: 'Cancel receipt', style: 'destructive', onPress: () => {
+                    if (!cancelQueueItem(item.identity)) {
+                      Alert.alert('Printing already started', 'Cancellation is unavailable after printing begins.');
+                    }
                   }
-                }
-              },
-            ],
-          )}>
-          <Text style={styles.cancelQueueText}>Cancel</Text>
-        </Pressable>
+                },
+              ],
+            )}>
+            <Text style={styles.cancelQueueText}>Cancel</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Print receipt ${item.receipt.transactionNumber}`}
+            disabled={printBusy}
+            style={({ pressed }) => [styles.rowPrintBtn, printBusy && styles.actionBtnDisabled, pressed && styles.actionBtnPressed]}
+            onPress={onPrint}>
+            <Icon name="printer-outline" size={16} color="#fff" />
+            <Text style={styles.rowPrintText}>Print</Text>
+          </Pressable>
+        </View>
+      )}
+      {isFailed && (
+        <View style={styles.rowActions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Retry receipt ${item.receipt.transactionNumber}`}
+            disabled={printBusy}
+            style={({ pressed }) => [styles.rowPrintBtn, printBusy && styles.actionBtnDisabled, pressed && styles.actionBtnPressed]}
+            onPress={onRetry}>
+            <Icon name="printer-outline" size={16} color="#fff" />
+            <Text style={styles.rowPrintText}>Retry</Text>
+          </Pressable>
+        </View>
       )}
       {isPrinting && <Text style={styles.itemError}>Printing has started; cancellation is unavailable.</Text>}
     </View>
@@ -317,6 +443,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: `${Colors.error}55`,
     paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.xs,
     borderRadius: BorderRadius.md,
   },
   retryBtnText: {
@@ -324,6 +451,43 @@ const styles = StyleSheet.create({
     color: Colors.error,
     fontWeight: '600',
   },
+  printAllBtn: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.md,
+    borderRadius: BorderRadius.md,
+    borderWidth: 1,
+    borderColor: `${Colors.primary}88`,
+  },
+  printAllText: { ...Typography.bodyMedium, color: Colors.primaryLight, fontWeight: '600' },
+  outlineDisabled: { opacity: 0.4 },
+  selectionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.sm,
+    marginTop: Spacing.sm,
+  },
+  selectAllText: { ...Typography.captionMedium, color: Colors.primaryLight },
+  selectionCount: { ...Typography.caption, color: Colors.textSecondary, flex: 1, textAlign: 'center' },
+  rowActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+    gap: Spacing.sm,
+    marginTop: Spacing.sm,
+  },
+  rowPrintBtn: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.xs,
+    paddingHorizontal: Spacing.lg,
+    borderRadius: BorderRadius.sm,
+    backgroundColor: Colors.primary,
+  },
+  rowPrintText: { ...Typography.bodyMedium, color: '#fff', fontWeight: '600' },
   listContent: {
     padding: Spacing.base,
     gap: Spacing.sm,
@@ -377,7 +541,7 @@ const styles = StyleSheet.create({
     color: Colors.textPrimary,
     fontWeight: '600',
   },
-  cancelQueueBtn: { minHeight: 48, alignSelf: 'flex-end', justifyContent: 'center', paddingHorizontal: Spacing.lg, borderRadius: BorderRadius.sm, borderWidth: 1, borderColor: Colors.borderLight, marginTop: Spacing.sm },
+  cancelQueueBtn: { minHeight: 44, justifyContent: 'center', paddingHorizontal: Spacing.lg, borderRadius: BorderRadius.sm, borderWidth: 1, borderColor: Colors.borderLight },
   cancelQueueText: { ...Typography.bodyMedium, color: Colors.error, fontWeight: '600' },
   itemStatus: {
     ...Typography.captionMedium,

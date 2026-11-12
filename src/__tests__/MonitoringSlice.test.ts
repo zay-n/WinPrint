@@ -310,20 +310,28 @@ describe('MonitoringService — flows', () => {
     expect(useAppStore.getState().queue).toHaveLength(0);
   });
 
-  test('11. Reconciliation enqueues CSV without calling processQueue', async () => {
-    const receipt = makeReceipt('005');
+  test('11. Reconciliation only detects new CSVs: nothing is parsed, enqueued or printed', async () => {
     mockListCsvFiles.mockResolvedValue([
       { id: 'file-abc', name: 'test.csv', mimeType: 'text/csv' },
+      { id: 'file-def', name: 'test2.csv', mimeType: 'text/csv' },
     ]);
-    mockDownloadAndParseCsv.mockResolvedValue(makeParsedCsv([receipt]));
+    mockDownloadAndParseCsv.mockResolvedValue(makeParsedCsv([makeReceipt('005')]));
     mockSuccessBackend();
 
     const processQueueMock = jest.fn().mockResolvedValue(undefined);
-    const accessor = buildStoreAccessor(processQueueMock);
+    const setIncomingFiles = jest.fn();
+    const accessor = {...buildStoreAccessor(processQueueMock), setIncomingFiles};
     await MonitoringService.initialize(accessor, backendUrl);
-    await MonitoringService.runReconciliation();
+    const found = await MonitoringService.runReconciliation();
 
-    expect(useAppStore.getState().queue).toHaveLength(1);
+    expect(found).toBe(2);
+    expect(setIncomingFiles).toHaveBeenCalledWith([
+      expect.objectContaining({ id: 'file-abc' }),
+      expect.objectContaining({ id: 'file-def' }),
+    ]);
+    expect(mockDownloadAndParseCsv).not.toHaveBeenCalled();
+    expect(useAppStore.getState().queue).toHaveLength(0);
+    expect(useAppStore.getState().csvProgress).toEqual({});
     expect(processQueueMock).not.toHaveBeenCalled();
     expect(useAppStore.getState().lastReconciliationAt).not.toBeNull();
   });
@@ -697,13 +705,11 @@ describe('MonitoringSlice — LATER / Deferred Receipts', () => {
     expect(useAppStore.getState().queue).toHaveLength(0);
   });
 
-  test('27. Reconciliation ignores explicitly deferred file IDs', async () => {
-    const freshReceipt = makeReceipt('999', 'file-fresh');
+  test('27. Reconciliation does not count explicitly deferred files as new, and enqueues nothing', async () => {
     mockListCsvFiles.mockResolvedValue([
       { id: 'file-deferred', name: 'deferred.csv', mimeType: 'text/csv' },
       { id: 'file-fresh', name: 'fresh.csv', mimeType: 'text/csv' },
     ]);
-    mockDownloadAndParseCsv.mockResolvedValue(makeParsedCsv([freshReceipt]));
     mockSuccessBackend();
 
     useAppStore.setState({
@@ -714,15 +720,10 @@ describe('MonitoringSlice — LATER / Deferred Receipts', () => {
 
     const accessor = buildStoreAccessor();
     await MonitoringService.initialize(accessor, backendUrl);
-    await MonitoringService.runReconciliation();
+    expect(await MonitoringService.runReconciliation()).toBe(1);
 
-    // Only file-fresh was downloaded & enqueued
-    expect(mockDownloadAndParseCsv).toHaveBeenCalledTimes(1);
-    expect(mockDownloadAndParseCsv).toHaveBeenCalledWith(expect.objectContaining({ id: 'file-fresh' }));
-
-    const queue = useAppStore.getState().queue;
-    expect(queue).toHaveLength(1);
-    expect(queue[0].identity).toBe('file-fresh::INV::999');
+    expect(mockDownloadAndParseCsv).not.toHaveBeenCalled();
+    expect(useAppStore.getState().queue).toHaveLength(0);
 
     // file-deferred is STILL in deferredFileIds
     expect(useAppStore.getState().deferredFileIds).toContain(
@@ -847,9 +848,8 @@ describe('MonitoringService Drive recovery', () => {
     }
   });
 
-  test('DriveAuthError during file download exposes reconnect state and preserves deferred entries', async () => {
-    mockListCsvFiles.mockResolvedValue([{id: 'file-abc', name: 'test.csv', mimeType: 'text/csv'}]);
-    mockDownloadAndParseCsv.mockRejectedValue(new DriveAuthError('expired token'));
+  test('DriveAuthError during folder listing exposes reconnect state and preserves deferred entries', async () => {
+    mockListCsvFiles.mockRejectedValue(new DriveAuthError('expired token'));
     useAppStore.setState({deferredFileIds: ['deferred-file::folder-123::later.csv']});
     await MonitoringService.initialize(buildStoreAccessor(), backendUrl);
 
@@ -861,40 +861,35 @@ describe('MonitoringService Drive recovery', () => {
     expect(useAppStore.getState().queue).toHaveLength(0);
   });
 
-  test('ordinary malformed CSV is skipped and later files still enqueue', async () => {
-    const receipt = makeReceipt('good-file', 'good-file');
+  test('reconciliation never downloads CSV contents, so a malformed CSV cannot affect detection', async () => {
     mockListCsvFiles.mockResolvedValue([
       {id: 'bad-file', name: 'bad.csv', mimeType: 'text/csv'},
       {id: 'good-file', name: 'good.csv', mimeType: 'text/csv'},
     ]);
-    mockDownloadAndParseCsv
-      .mockRejectedValueOnce(new Error('Malformed CSV'))
-      .mockResolvedValueOnce(makeParsedCsv([receipt]));
+    mockDownloadAndParseCsv.mockRejectedValue(new Error('Malformed CSV'));
     await MonitoringService.initialize(buildStoreAccessor(), backendUrl);
 
-    await MonitoringService.runReconciliation();
+    expect(await MonitoringService.runReconciliation()).toBe(2);
 
-    expect(useAppStore.getState().queue.map(item => item.identity)).toContain('good-file::INV::good-file');
+    expect(mockDownloadAndParseCsv).not.toHaveBeenCalled();
+    expect(useAppStore.getState().queue).toHaveLength(0);
     expect(useAppStore.getState().driveNeedsReauth).toBe(false);
   });
 
-  test('folder reconciliation skips files already in durable queue/archive state', async () => {
-    const receipt = makeReceipt('new', 'new-file');
+  test('folder reconciliation does not count files already in durable queue/archive state as new', async () => {
     mockListCsvFiles.mockResolvedValue([
       {id: 'known-file', name: 'known.csv', mimeType: 'text/csv'},
       {id: 'new-file', name: 'new.csv', mimeType: 'text/csv'},
     ]);
-    mockDownloadAndParseCsv.mockResolvedValue(makeParsedCsv([receipt]));
     const accessor = {
       ...buildStoreAccessor(),
       isCsvKnown: (fileId: string) => fileId === 'known-file',
     };
     await MonitoringService.initialize(accessor, backendUrl);
-    await MonitoringService.runReconciliation();
+    expect(await MonitoringService.runReconciliation()).toBe(1);
 
-    expect(mockDownloadAndParseCsv).toHaveBeenCalledTimes(1);
-    expect(mockDownloadAndParseCsv).toHaveBeenCalledWith(expect.objectContaining({id: 'new-file'}));
-    expect(useAppStore.getState().queue.map(item => item.receipt.sourceFile?.driveFileId)).toContain('new-file');
+    expect(mockDownloadAndParseCsv).not.toHaveBeenCalled();
+    expect(useAppStore.getState().queue).toHaveLength(0);
   });
 });
 

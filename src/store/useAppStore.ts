@@ -139,6 +139,8 @@ interface DriveActions {
   selectFolder: (folder: FolderSelection | DriveFile) => Promise<void>;
   selectArchiveFolder: (folder: FolderSelection | DriveFile) => void;
   loadCsvFiles: () => Promise<void>;
+  /** Apply a fresh Incoming-folder listing (detection only: nothing is parsed or queued). */
+  setCsvFiles: (listed: DriveFile[]) => void;
   loadArchiveFiles: () => Promise<void>;
   /** Refresh Incoming + Printed listings (e.g. after a successful archive). */
   refreshDriveListings: () => Promise<void>;
@@ -156,6 +158,8 @@ interface CsvState {
   lastParsedFileId: string | null;
   /** CSV currently going through the one-step Process CSV flow. */
   processingFileId: string | null;
+  /** Progress of a multi-file "Process Selected" run. */
+  batchProgress: { done: number; total: number } | null;
 }
 
 interface CsvActions {
@@ -163,6 +167,8 @@ interface CsvActions {
   downloadAndParse: (file: DriveFile) => Promise<boolean>;
   /** One step: download + parse + enqueue every eligible receipt. Null on failure (see csvError). */
   processCsv: (file: DriveFile) => Promise<EnqueueResult | null>;
+  /** Process only the given CSVs, one after another. Other CSVs are untouched. */
+  processCsvFiles: (files: DriveFile[]) => Promise<BatchProcessResult | null>;
   clearReceipts: () => void;
 }
 
@@ -229,6 +235,14 @@ export interface EnqueueResult {
   total: number;
 }
 
+export interface BatchProcessResult {
+  /** Files parsed successfully. */
+  processed: number;
+  added: number;
+  skipped: number;
+  failed: { name: string; error: string }[];
+}
+
 export interface CsvProgress {
   driveFileId: string;
   sourceFolderId: string;
@@ -265,12 +279,17 @@ interface QueueActions {
   enqueueReceipts: (receipts: Receipt[]) => EnqueueResult;
   prepareCsvForQueue: (driveFileId: string, sourceFolderId: string, expectedCount: number) => void;
   updateQueueItemStatus: (identity: string, status: PrintStatus, error?: string) => Promise<void>;
-  retryFailedPrints: () => void;
+  /** FAILED -> QUEUED for all failed receipts, or only the given identities. */
+  retryFailedPrints: (identities?: string[]) => void;
   cancelQueueItem: (identity: string) => boolean;
   retryArchive: (driveFileId: string) => Promise<void>;
   resumePendingArchives: () => Promise<void>;
   clearHistory: () => void;
-  processQueue: () => Promise<void>;
+  /**
+   * Print QUEUED receipts one after another. With `identities`, only those
+   * receipts are printed; everything else stays queued.
+   */
+  processQueue: (identities?: string[]) => Promise<void>;
   /** After a restart: receipts left in PRINTING become FAILED (retryable, never auto-reprinted). */
   recoverInterruptedPrints: () => number;
   reprintReceipt: (identity: string) => Promise<PrintResult>;
@@ -806,17 +825,8 @@ export const useAppStore = create<AppStore>()(
         set({ csvLoading: true, driveError: null, driveNeedsReauth: false });
         try {
           const listed = (await DriveService.listCsvFiles(sourceFolderId)) ?? [];
-          const progress = get().csvProgress;
-          // The current Drive folder decides where a file appears. Only hide a
-          // CSV archived moments ago (the listing can briefly lag the move); an
-          // archived CSV that was moved back to Incoming must stay visible.
-          const now = Date.now();
-          const csvFiles = listed.filter(f => {
-            const p = progress[f.id];
-            return !(p?.archiveStatus === 'ARCHIVED' && p.archivedAt !== undefined &&
-              now - p.archivedAt < ARCHIVE_LISTING_GRACE_MS);
-          });
-          set({ csvFiles, csvLoading: false, driveAccessChecked: true, driveNeedsReauth: false });
+          get().setCsvFiles(listed);
+          set({ csvLoading: false, driveAccessChecked: true, driveNeedsReauth: false });
         } catch (e: unknown) {
           const isDriveAuthError = e instanceof DriveAuthError;
           const err = e as { message?: string };
@@ -829,6 +839,21 @@ export const useAppStore = create<AppStore>()(
             driveAccessChecked: isDriveAuthError ? true : get().driveAccessChecked,
           });
         }
+      },
+
+      setCsvFiles: (listed: DriveFile[]) => {
+        const progress = get().csvProgress;
+        // The current Drive folder decides where a file appears. Only hide a
+        // CSV archived moments ago (the listing can briefly lag the move); an
+        // archived CSV that was moved back to Incoming must stay visible.
+        const now = Date.now();
+        set({
+          csvFiles: listed.filter(f => {
+            const p = progress[f.id];
+            return !(p?.archiveStatus === 'ARCHIVED' && p.archivedAt !== undefined &&
+              now - p.archivedAt < ARCHIVE_LISTING_GRACE_MS);
+          }),
+        });
       },
 
       loadArchiveFiles: async () => {
@@ -853,6 +878,7 @@ export const useAppStore = create<AppStore>()(
       csvError: null,
       lastParsedFileId: null,
       processingFileId: null,
+      batchProgress: null,
 
       // â”€â”€ CSV actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -952,6 +978,30 @@ export const useAppStore = create<AppStore>()(
           return get().enqueueReceipts(receipts);
         } finally {
           set({ processingFileId: null });
+        }
+      },
+
+      processCsvFiles: async (files: DriveFile[]) => {
+        if (files.length === 0 || get().batchProgress || get().processingFileId || get().parseLoading) return null;
+        const result: BatchProcessResult = { processed: 0, added: 0, skipped: 0, failed: [] };
+        set({ batchProgress: { done: 0, total: files.length } });
+        try {
+          for (let i = 0; i < files.length; i++) {
+            const one = await get().processCsv(files[i]);
+            if (one) {
+              result.processed++;
+              result.added += one.added;
+              result.skipped += one.skipped;
+            } else {
+              result.failed.push({ name: files[i].name, error: get().csvError ?? 'Could not be processed.' });
+            }
+            set({ batchProgress: { done: i + 1, total: files.length } });
+          }
+          // Per-file errors are reported in the result, not left as a stale banner.
+          if (result.failed.length > 0) set({ csvError: null });
+          return result;
+        } finally {
+          set({ batchProgress: null });
         }
       },
 
@@ -1310,9 +1360,12 @@ export const useAppStore = create<AppStore>()(
         if (archiveFileId) await get().retryArchive(archiveFileId);
       },
 
-      retryFailedPrints: () => {
+      retryFailedPrints: (identities?: string[]) => {
         const { queue } = get();
-        const newQueue = queue.map(q => q.status === 'FAILED' ? { ...q, status: 'QUEUED' as PrintStatus, error: undefined } : q);
+        const only = identities ? new Set(identities) : null;
+        const newQueue = queue.map(q => q.status === 'FAILED' && (!only || only.has(q.identity))
+          ? { ...q, status: 'QUEUED' as PrintStatus, error: undefined }
+          : q);
         set({ queue: newQueue });
       },
 
@@ -1475,7 +1528,8 @@ export const useAppStore = create<AppStore>()(
         set({ queue: [], csvProgress: {}, reprintHistory: [] });
       },
 
-      processQueue: async () => {
+      processQueue: async (identities?: string[]) => {
+        const only = identities ? new Set(identities) : null;
         if (queueProcessingInFlight) {
           console.log('[WinPrint][Queue] processQueue: already in flight, skipping');
           return;
@@ -1485,7 +1539,7 @@ export const useAppStore = create<AppStore>()(
         try {
           while (true) {
             const {queue, printReceipt, updateQueueItemStatus} = get();
-            const nextItem = queue.find(item => item.status === 'QUEUED');
+            const nextItem = queue.find(item => item.status === 'QUEUED' && (!only || only.has(item.identity)));
             if (!nextItem) {
               console.log('[WinPrint][Queue] processQueue: no QUEUED items remain, done');
               break;

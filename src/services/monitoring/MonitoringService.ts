@@ -13,7 +13,8 @@
  * ARCHITECTURE:
  *  - All Drive verification is done here (downloadAndParseCsv) before enqueue.
  *  - Enqueue uses the existing store.enqueueReceipt() with duplicate protection.
- *  - processQueue() is only called for PRINT actions, never for reconciliation.
+ *  - Reconciliation only detects new CSVs; it never parses, enqueues or prints.
+ *  - processQueue() is only called for PRINT actions, and only for that file.
  */
 
 import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
@@ -68,7 +69,10 @@ export interface StoreAccessor {
   enqueueReceipt: (receipt: import('../../models/Receipt').Receipt) => void;
   prepareCsvForQueue: (driveFileId: string, sourceFolderId: string, expectedCount: number) => void;
   isCsvKnown?: (driveFileId: string) => boolean;
-  processQueue: () => Promise<void>;
+  /** Print queued receipts; with a Drive file ID, only that file's receipts. */
+  processQueue: (driveFileId?: string) => Promise<void>;
+  /** Hand a fresh Incoming-folder listing to the UI (detection only). */
+  setIncomingFiles?: (files: import('../drive/DriveClient').DriveFile[]) => void;
   setFcmToken: (token: string) => void;
   setFcmRegistrationStatus: (s: FcmStatus) => void;
   setServiceAccountEmail: (email: string) => void;
@@ -460,8 +464,9 @@ export async function handlePrintAction(intent: PrintIntentData): Promise<void> 
       store.enqueueReceipt(receipt);
     }
 
-    // Step 4: Start printing.
-    await store.processQueue();
+    // Step 4: Print only this file's receipts — the user asked for this file,
+    // not for everything else waiting in the queue.
+    await store.processQueue(targetFile.id);
 
     store.setMonitoringError(null);
   } catch (e) {
@@ -492,11 +497,11 @@ export function handleLaterAction(fileId: string, folderId: string, fileName?: s
 /**
  * Run a reconciliation pass:
  *  - List all CSVs currently in the Incoming Drive folder.
- *  - Enqueue any that haven't already been processed (duplicate protection).
- *  - Skips files currently present in deferredFileIds (respects user LATER choice).
- *  - Does NOT call processQueue() — no automatic printing.
+ *  - Report how many are new (not deferred, not already queued/printed).
+ *  - Detection only: never downloads, parses, enqueues or prints. The user
+ *    selects which CSVs to process on the Drive tab.
  *
- * The user must manually start printing from the Queue screen.
+ * @returns the number of new CSV files found.
  */
 export async function runReconciliation(): Promise<number> {
   if (!store || reconciliationInFlight) return 0;
@@ -511,7 +516,7 @@ export async function runReconciliation(): Promise<number> {
   const deferredIds = store.getDeferredFileIds ? store.getDeferredFileIds() : [];
   const deferredSet = new Set(deferredIds.map(d => d.split('::')[0]));
 
-  let discoveredTransactions = 0;
+  let newFiles = 0;
   try {
     const csvFiles = await DriveService.listCsvFiles(folderId);
     store.setDriveAccessAvailable?.();
@@ -520,24 +525,15 @@ export async function runReconciliation(): Promise<number> {
       if (deferredSet.has(file.id)) {
         continue;
       }
-      // Durable queue/archive state already accounts for this file. Avoid
-      // downloading and parsing it again during a folder refresh.
+      // Durable queue/archive state already accounts for this file.
       if (store.isCsvKnown?.(file.id)) continue;
-      try {
-        const { receipts } = await DriveService.downloadAndParseCsv(file);
-        store.setDriveAccessAvailable?.();
-        store.prepareCsvForQueue(file.id, folderId, receipts.length);
-        for (const receipt of receipts) {
-          store.enqueueReceipt(receipt);
-        }
-        discoveredTransactions += receipts.length;
-      } catch (e) {
-        if (e instanceof DriveAuthError) throw e;
-        console.warn(`[WinPrint][Monitoring] Skipping unreadable CSV ${file.id}:`, e);
-      }
+      // Detection only: the user chooses which CSVs to process on the Drive
+      // tab. Nothing is downloaded, parsed or queued here.
+      newFiles++;
     }
+    store.setIncomingFiles?.(csvFiles);
     store.setMonitoringError(null);
-    return discoveredTransactions;
+    return newFiles;
   } catch (e) {
     if (e instanceof DriveAuthError) {
       store.setDriveNeedsReauth?.(true);
