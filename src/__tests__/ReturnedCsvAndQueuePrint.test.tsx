@@ -6,7 +6,7 @@
  *     recovery of a receipt left in PRINTING by an app restart.
  */
 import React from 'react';
-import {Alert, Text} from 'react-native';
+import {Text} from 'react-native';
 import renderer, {act} from 'react-test-renderer';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import DriveScreen from '../screens/drive/DriveScreen';
@@ -134,10 +134,11 @@ describe('Issue 1 — archived CSV moved back to the Incoming folder', () => {
     const t = texts(tree);
     expect(t.filter(x => x === 'sales.csv')).toHaveLength(1);
     expect(t).toContain('Already Printed');
-    expect(t).toContain('No files waiting to be processed');
-    expect(t).toContain('Nothing waiting to print');
+    expect(t).toContain('No files waiting');
     expect(t.filter(x => x === 'Completed')).toHaveLength(1);
-    expect(tree.root.findAllByProps({accessibilityLabel: 'Process CSV sales.csv'})).toHaveLength(0);
+    // no checkbox: a returned file cannot be added to the print queue again
+    expect(tree.root.findAll(n => n.props.accessibilityLabel === 'Select sales.csv')).toHaveLength(0);
+    expect(t).not.toContain('Add to Print Queue (0)');
     act(() => tree.unmount());
   });
 });
@@ -235,7 +236,7 @@ describe('Issue 2 — queued receipts print only through the explicit print acti
     expect(st().queue[0].status).toBe('PRINTED');
   });
 
-  it('Drive tab: printing a file is explicit, confirmed, and limited to that file', async () => {
+  it('Drive tab has no print actions or receipt cards: printing happens only in the Print Queue', async () => {
     const processQueue = jest.fn(async (_ids?: string[]) => {});
     useAppStore.setState({processQueue, csvFiles: [file]});
     (DriveService.listCsvFiles as jest.Mock).mockImplementation(async folder => (folder === 'src' ? [file] : []));
@@ -245,21 +246,14 @@ describe('Issue 2 — queued receipts print only through the explicit print acti
       tree = renderer.create(<DriveScreen navigation={{navigate: jest.fn()} as any} route={{} as any} />);
       await flush();
     });
+    const t = texts(tree);
+    expect(t).toContain('In Print Queue');
+    expect(t).toContain('0 of 2 printed. Its receipts are waiting in the Print Queue.');
+    expect(t.some(x => /Print (These|Now|All|Selected)/.test(x))).toBe(false);
+    expect(t).not.toContain('INVOICE 1');
+    const labels = tree.root.findAll(n => typeof n.props.accessibilityLabel === 'string').map(n => n.props.accessibilityLabel as string);
+    expect(labels.some(l => /^Print /.test(l))).toBe(false);
     expect(processQueue).not.toHaveBeenCalled();
-    // another file's receipt is also waiting in the queue
-    await act(async () => {
-      st().enqueueReceipt({...rcpt('9', 'other'), sourceFile: {driveFileId: 'other', driveFileName: 'other.csv'}});
-      await flush();
-    });
-    expect(texts(tree)).toContain('Print These (2)');
-    const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
-    const btn = tree.root.findByProps({accessibilityLabel: 'Print receipts from sales.csv'});
-    act(() => btn.props.onPress());
-    expect(processQueue).not.toHaveBeenCalled(); // waits for confirmation
-    act(() => alert.mock.calls[0][2]![1].onPress!());
-    expect(processQueue).toHaveBeenCalledTimes(1);
-    expect(processQueue).toHaveBeenCalledWith(['f1::INVOICE::1', 'f1::INVOICE::2']);
-    alert.mockRestore();
     act(() => tree.unmount());
   });
 });

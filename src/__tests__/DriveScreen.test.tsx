@@ -50,38 +50,41 @@ describe('DriveScreen workflow', () => {
   });
   afterEach(() => act(() => tree?.unmount()));
 
-  it('one tap on Process CSV queues receipts and shows clear statuses', async () => {
+  it('select a CSV, Add to Print Queue, then it completes after printing and archiving', async () => {
     await act(async () => {
       tree = renderer.create(<DriveScreen navigation={{navigate} as any} route={{} as any} />);
       await flush();
     });
+    const press = async (label: string) => {
+      await act(async () => {
+        tree.root.findAll(n => n.props.accessibilityLabel === label && typeof n.props.onPress === 'function')[0].props.onPress();
+        await flush();
+      });
+    };
     let t = texts(tree);
     expect(t).toContain('Incoming CSV Files');
-    expect(t).toContain('1 file waiting to be processed');
-    expect(t).toContain('Receipts Ready to Print');
-    expect(t).toContain('Nothing waiting to print');
+    expect(t).toContain('1 file not added to the print queue yet');
     expect(t).toContain('Completed');
-    expect(t).not.toContain('Enqueue All');
-    expect(t).not.toContain('Parsed Data');
+    // Drive only handles files: no receipt cards and no print actions.
+    for (const gone of ['Receipts Ready to Print', 'Enqueue All', 'Parsed Data', 'Process CSV']) {
+      expect(t).not.toContain(gone);
+    }
 
-    const btn = tree.root.findByProps({accessibilityLabel: 'Process CSV sales.csv'});
-    await act(async () => {
-      btn.props.onPress();
-      await flush();
-    });
+    await press('Select sales.csv');
+    await press('Add to Print Queue (1)');
     t = texts(tree);
     expect(useAppStore.getState().queue).toHaveLength(2);
-    expect(t).toContain('2 receipts added to the print queue. Not printed yet — choose what to print.');
+    expect(t).toContain('1 file processed: 2 receipts added to the print queue. Open the Print Queue to print them.');
     // Queued is not printed: nothing has been sent to the printer yet.
     expect(useAppStore.getState().queue.every(q => q.status === 'QUEUED')).toBe(true);
-    expect(t).toContain('No files waiting to be processed');
-    expect(t).toContain('2 receipts to print from 1 file');
-    expect(t).toContain('INVOICE 1');
-    expect(t).toContain('01/10/2023 · Acme');
-    expect(t.filter(x => x === 'Queued').length).toBeGreaterThanOrEqual(3);
-    expect(tree.root.findAllByProps({accessibilityLabel: 'Process CSV sales.csv'})).toHaveLength(0);
+    expect(t).toContain('No files waiting');
+    expect(t).toContain('In Print Queue');
+    expect(t.some(x => x.startsWith('2 receipts'))).toBe(true); // receipt count on the file card
+    expect(t).not.toContain('INVOICE 1'); // individual receipts live in the Print Queue only
+    await press('Open Print Queue');
+    expect(navigate).toHaveBeenCalledWith('Queue');
 
-    // Print everything + archive succeeds -> gone from active sections, no reopen needed
+    // Print everything + archive succeeds -> gone from Incoming, no reopen needed
     (DriveService.moveFile as jest.Mock).mockResolvedValue(undefined);
     (DriveService.listCsvFiles as jest.Mock).mockImplementation(async folder =>
       folder === 'arch' ? [file, done] : [],
@@ -95,9 +98,7 @@ describe('DriveScreen workflow', () => {
     });
     t = texts(tree);
     expect(t).toContain('No incoming files');
-    expect(t).toContain('Nothing waiting to print');
     expect(t).toContain('2 files printed and moved to the Printed folder');
-    expect(t).not.toContain('INVOICE 1');
     expect(useAppStore.getState().queue.filter(q => q.status === 'PRINTED')).toHaveLength(2);
   });
 
@@ -113,6 +114,6 @@ describe('DriveScreen workflow', () => {
     const t = texts(tree);
     expect(t).toContain('Archive Pending');
     expect(t).toContain('Retry Move to Printed');
-    expect(tree.root.findAllByProps({accessibilityLabel: 'Process CSV sales.csv'})).toHaveLength(0);
+    expect(tree.root.findAll(n => n.props.accessibilityLabel === 'Select sales.csv')).toHaveLength(0);
   });
 });

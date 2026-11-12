@@ -21,9 +21,9 @@ export type CsvDisplayStatus =
   | 'RETURNED';
 
 export const CSV_STATUS_LABEL: Record<CsvDisplayStatus, string> = {
-  NEW: 'Waiting to be processed',
-  READY: 'Ready to Print',
-  QUEUED: 'Queued',
+  NEW: 'New',
+  READY: 'New',
+  QUEUED: 'In Print Queue',
   PRINTING: 'Printing',
   PRINT_FAILED: 'Print Failed',
   ARCHIVE_PENDING: 'Archive Pending',

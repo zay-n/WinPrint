@@ -110,7 +110,7 @@ describe('Incoming CSVs: detect, select, process', () => {
     expect(st().queue).toHaveLength(3);
   });
 
-  it('Drive tab: checkboxes, Select All / Deselect All and Process Selected (N)', async () => {
+  it('Drive tab: checkboxes, Select All / Deselect All and Add to Print Queue (N)', async () => {
     (DriveService.listCsvFiles as jest.Mock).mockImplementation(async folder => (folder === 'src' ? [f('f1'), f('f2'), f('f3')] : []));
     serve({f1: ['1'], f2: ['2'], f3: ['3']});
     const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
@@ -129,25 +129,25 @@ describe('Incoming CSVs: detect, select, process', () => {
       tree.root.findAll(n => typeof n.props.onPress === 'function' && n.findAllByType(Text).some(t => t.props.children === text))
         .slice(-1)[0];
 
-    expect(texts(tree)).toContain('Process Selected (0)');
-    await press('Process Selected (0)');
+    expect(texts(tree)).toContain('Add to Print Queue (0)');
+    await press('Add to Print Queue (0)');
     expect(alert).toHaveBeenCalledWith('No files selected', expect.any(String));
     expect(DriveService.downloadAndParseCsv).not.toHaveBeenCalled();
 
     await act(async () => { byText('Select All').props.onPress(); });
-    expect(texts(tree)).toContain('Process Selected (3)');
+    expect(texts(tree)).toContain('Add to Print Queue (3)');
     await act(async () => { byText('Deselect All').props.onPress(); });
-    expect(texts(tree)).toContain('Process Selected (0)');
+    expect(texts(tree)).toContain('Add to Print Queue (0)');
 
     await press('Select f2.csv');
-    expect(texts(tree)).toContain('Process Selected (1)');
-    await press('Process Selected (1)');
+    expect(texts(tree)).toContain('Add to Print Queue (1)');
+    await press('Add to Print Queue (1)');
     expect((DriveService.downloadAndParseCsv as jest.Mock).mock.calls.map(c => c[0].id)).toEqual(['f2']);
     expect(st().queue.map(q => q.identity)).toEqual(['f2::INV::2']);
     const t = texts(tree);
-    expect(t).toContain('1 file processed: 1 receipt added to the print queue. Not printed yet — choose what to print.');
-    expect(t).toContain('2 files waiting to be processed');
-    expect(t).toContain('Process Selected (0)');
+    expect(t).toContain('1 file processed: 1 receipt added to the print queue. Open the Print Queue to print them.');
+    expect(t).toContain('2 files not added to the print queue yet');
+    expect(t).toContain('Add to Print Queue (0)');
     // the processed file is no longer selectable; the other two still are
     expect(tree.root.findAll(n => n.props.accessibilityLabel === 'Select f2.csv')).toHaveLength(0);
     expect(tree.root.findAll(n => n.props.accessibilityLabel === 'Select f1.csv').length).toBeGreaterThan(0);
@@ -312,18 +312,34 @@ describe('Queue screen selection and actions', () => {
     expect(has('Print Selected (0)')).toBe(true); // selection cleared
   });
 
-  it('Select All / Deselect All, and Print All asks first', async () => {
+  it('Select All then Print Selected prints everything waiting; there is no separate Print All', async () => {
     queueUp('f1', ['1', '2', '3']);
     await render();
+    expect(tree.root.findAll(n => typeof n.props.accessibilityLabel === 'string' && n.props.accessibilityLabel.startsWith('Print All'))).toHaveLength(0);
     pressText('Select All');
     expect(has('Print Selected (3)')).toBe(true);
     pressText('Deselect All');
     expect(has('Print Selected (0)')).toBe(true);
 
-    press('Print All (3)');
+    pressText('Select All');
+    press('Print Selected (3)');
     expect(processQueue).not.toHaveBeenCalled();
     confirm();
     expect(processQueue).toHaveBeenCalledWith(['f1::INV::1', 'f1::INV::2', 'f1::INV::3']);
+  });
+
+  it('each card shows number, customer, amount and status; one ticked receipt prints without an extra prompt', async () => {
+    queueUp('f1', ['1', '2']);
+    await render();
+    const t = tree.root.findAllByType(Text).map(x => [x.props.children].flat(Infinity).join(''));
+    for (const expected of ['INV 1', 'Acme', 'Amount: 42', 'Waiting to print', 'Print']) {
+      expect(t).toContain(expected);
+    }
+    expect(t).not.toContain('Cancel');
+    press('Select receipt INV 2');
+    press('Print Selected (1)');
+    expect(alert).not.toHaveBeenCalled();
+    expect(processQueue).toHaveBeenCalledWith(['f1::INV::2']);
   });
 
   it('printing and failed receipts cannot be selected or printed; failed ones offer Retry', async () => {
@@ -333,8 +349,11 @@ describe('Queue screen selection and actions', () => {
         i === 0 ? {...q, status: 'FAILED' as const, error: 'jam'} : q),
     });
     await render();
-    expect(has('Select receipt INV 1')).toBe(false);
+    const box = (label: string) => tree.root.findAll(n => n.props.accessibilityLabel === label && n.props.accessibilityRole === 'checkbox')[0];
+    expect(box('Select receipt INV 1').props.disabled).toBe(true);
     expect(has('Print receipt 1')).toBe(false);
+    pressText('Select All');
+    expect(has('Print Selected (2)')).toBe(true); // the failed receipt is not selectable
     press('Retry receipt 1');
     expect(retryFailedPrints).toHaveBeenCalledWith(['f1::INV::1']);
     expect(processQueue).toHaveBeenCalledWith(['f1::INV::1']);
@@ -345,11 +364,13 @@ describe('Queue screen selection and actions', () => {
       queue: st().queue.map((q, i) => (i === 1 ? {...q, status: 'PRINTING' as const} : q)),
     });
     await render();
-    expect(has('Select receipt INV 2')).toBe(false);
+    expect(box('Select receipt INV 2').props.disabled).toBe(true);
     expect(has('Print receipt 2')).toBe(false);
+    expect(has('Retry receipt 2')).toBe(false);
     // while something is printing, no other print can be started
     press('Print receipt 3');
-    press('Print All (1)');
+    press('Select receipt INV 3');
+    press('Print Selected (1)');
     expect(processQueue).not.toHaveBeenCalled();
   });
 });

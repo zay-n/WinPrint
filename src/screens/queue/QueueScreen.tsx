@@ -11,7 +11,6 @@ export default function QueueScreen() {
   const queue = useAppStore(s => s.queue);
   const processQueue = useAppStore(s => s.processQueue);
   const retryFailedPrints = useAppStore(s => s.retryFailedPrints);
-  const cancelQueueItem = useAppStore(s => s.cancelQueueItem);
   const printLoading = useAppStore(s => s.printLoading);
   const selectedPrinterType = useAppStore(s => s.selectedPrinterType);
 
@@ -24,8 +23,6 @@ export default function QueueScreen() {
   const enqueueAllDeferredFiles = useAppStore(s => s.enqueueAllDeferredFiles);
 
   const activeQueue = queue.filter(q => q.status !== 'PRINTED' && q.status !== 'CANCELLED');
-  const failedCount = activeQueue.filter(q => q.status === 'FAILED').length;
-  const queuedCount = activeQueue.filter(q => q.status === 'QUEUED').length;
   const deferredCount = deferredFileIds.length;
 
   // ── Receipt selection (only receipts waiting to print can be selected) ──
@@ -47,21 +44,27 @@ export default function QueueScreen() {
   const plural = (n: number) => `${n} receipt${n === 1 ? '' : 's'}`;
   const printerLabel = selectedPrinterType === 'office' ? 'Office' : 'Thermal';
 
-  const confirmPrint = (ids: string[], title: string) => {
+  // Bulk printing is sequential and limited to the ticked receipts.
+  const printSelected = () => {
     if (printBusy) return;
+    const ids = selectedIds;
     if (ids.length === 0) {
-      Alert.alert('No receipts selected', 'Tick the receipts you want to print, or use Print All.');
+      Alert.alert('No receipts selected', 'Tick the receipts you want to print.');
       return;
     }
-    Alert.alert(title, `${plural(ids.length)} will be sent to the ${printerLabel} printer, one after another.`, [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Print', onPress: () => {
-          setSelected(new Set());
-          void processQueue(ids);
-        },
-      },
-    ]);
+    const start = () => {
+      setSelected(new Set());
+      void processQueue(ids);
+    };
+    if (ids.length === 1) {
+      start();
+      return;
+    }
+    Alert.alert(
+      'Print selected receipts?',
+      `${plural(ids.length)} will be sent to the ${printerLabel} printer, one after another.`,
+      [{ text: 'Cancel', style: 'cancel' }, { text: 'Print', onPress: start }],
+    );
   };
 
   const printOne = (identity: string) => {
@@ -78,78 +81,42 @@ export default function QueueScreen() {
   return (
     <SafeAreaView style={styles.safe} edges={['bottom']}>
       <View style={styles.headerArea}>
-        <View style={styles.statsRow}>
-          <View style={styles.statBox}>
-            <Text style={styles.statLabel}>Waiting</Text>
-            <Text style={styles.statValue}>{queuedCount}</Text>
-          </View>
-          <View style={styles.statBox}>
-            <Text style={styles.statLabel}>Pending Action</Text>
-            <Text style={[styles.statValue, deferredCount > 0 && { color: Colors.warning }]}>
-              {deferredCount}
-            </Text>
-          </View>
-          <View style={styles.statBox}>
-            <Text style={styles.statLabel}>Failed</Text>
-            <Text style={[styles.statValue, failedCount > 0 && { color: Colors.error }]}>
-              {failedCount}
-            </Text>
-          </View>
-        </View>
-
-        <View style={styles.actionsRow}>
-          <Pressable
-            style={({ pressed }) => [
-              styles.actionBtn,
-              (selectedIds.length === 0 || printBusy) && styles.actionBtnDisabled,
-              pressed && styles.actionBtnPressed,
-            ]}
-            disabled={printBusy}
-            accessibilityRole="button"
-            accessibilityLabel={`Print Selected (${selectedIds.length})`}
-            onPress={() => confirmPrint(selectedIds, 'Print selected receipts?')}>
-            {printBusy ? (
-              <ActivityIndicator color="#fff" size="small" />
-            ) : (
-              <Icon name="printer-outline" size={18} color="#fff" />
-            )}
-            <Text style={styles.actionBtnText}>
-              {printBusy ? 'Printing…' : `Print Selected (${selectedIds.length})`}
-            </Text>
-          </Pressable>
-
-          <Pressable
-            style={({ pressed }) => [
-              styles.printAllBtn,
-              (queuedCount === 0 || printBusy) && styles.outlineDisabled,
-              pressed && styles.actionBtnPressed,
-            ]}
-            disabled={queuedCount === 0 || printBusy}
-            accessibilityRole="button"
-            accessibilityLabel={`Print All (${queuedCount})`}
-            onPress={() => confirmPrint(queuedIds, 'Print all waiting receipts?')}>
-            <Text style={styles.printAllText}>Print All ({queuedCount})</Text>
-          </Pressable>
-        </View>
-
         <View style={styles.selectionRow}>
-          {queuedIds.length > 0 ? (
-            <Pressable onPress={toggleAll} hitSlop={8} accessibilityRole="button">
-              <Text style={styles.selectAllText}>{allSelected ? 'Deselect All' : 'Select All'}</Text>
-            </Pressable>
-          ) : <View />}
+          <Pressable
+            onPress={toggleAll}
+            disabled={queuedIds.length === 0}
+            hitSlop={8}
+            accessibilityRole="button">
+            <Text style={[styles.selectAllText, queuedIds.length === 0 && styles.dimmed]}>
+              {allSelected ? 'Deselect All' : 'Select All'}
+            </Text>
+          </Pressable>
           <Text style={styles.selectionCount}>
-            {selectedIds.length} of {queuedIds.length} selected · {printerLabel} printer
+            {queuedIds.length === 0
+              ? 'No receipts waiting'
+              : `${selectedIds.length} of ${queuedIds.length} selected`}
           </Text>
-          {failedCount > 0 && (
-            <Pressable
-              style={({ pressed }) => [styles.retryBtn, pressed && styles.actionBtnPressed]}
-              accessibilityRole="button"
-              onPress={() => retryFailedPrints()}>
-              <Text style={styles.retryBtnText}>Retry Failed</Text>
-            </Pressable>
-          )}
         </View>
+        <Pressable
+          style={({ pressed }) => [
+            styles.actionBtn,
+            (selectedIds.length === 0 || printBusy) && styles.actionBtnDisabled,
+            pressed && styles.actionBtnPressed,
+          ]}
+          disabled={printBusy}
+          accessibilityRole="button"
+          accessibilityLabel={`Print Selected (${selectedIds.length})`}
+          onPress={printSelected}>
+          {printBusy ? (
+            <ActivityIndicator color="#fff" size="small" />
+          ) : (
+            <Icon name="printer-outline" size={18} color="#fff" />
+          )}
+          <Text style={styles.actionBtnText}>
+            {printBusy ? 'Printing…' : `Print Selected (${selectedIds.length})`}
+          </Text>
+        </Pressable>
+        <Text style={styles.printerHint}>{printerLabel} printer</Text>
       </View>
 
       <FlatList
@@ -245,7 +212,6 @@ export default function QueueScreen() {
         renderItem={({ item }) => (
           <QueueItemRow
             item={item}
-            cancelQueueItem={cancelQueueItem}
             selected={selected.has(item.identity)}
             onToggle={() => toggle(item.identity)}
             onPrint={() => printOne(item.identity)}
@@ -272,10 +238,9 @@ export default function QueueScreen() {
 }
 
 function QueueItemRow({
-  item, cancelQueueItem, selected, onToggle, onPrint, onRetry, printBusy,
+  item, selected, onToggle, onPrint, onRetry, printBusy,
 }: {
   item: QueueItem;
-  cancelQueueItem: (identity: string) => boolean;
   selected: boolean;
   onToggle: () => void;
   onPrint: () => void;
@@ -285,91 +250,45 @@ function QueueItemRow({
   const isQueued = item.status === 'QUEUED';
   const isFailed = item.status === 'FAILED';
   const isPrinting = item.status === 'PRINTING';
-  const statusLabel = isFailed ? 'Print failed' : isPrinting ? 'Printing...' : 'Waiting to print';
+  const statusLabel = isFailed ? 'Print failed' : isPrinting ? 'Printing…' : 'Waiting to print';
   const statusColor = isFailed ? Colors.error : isPrinting ? Colors.active : Colors.textSecondary;
+  const { receipt } = item;
+  const number = `${receipt.transactionType} ${receipt.transactionNumber}`;
+  const total = receipt.financials?.total;
 
   return (
     <View style={[styles.itemCard, isFailed && styles.itemCardFailed, isPrinting && styles.itemCardPrinting]}>
-      <View style={styles.itemHeader}>
-        <View style={styles.itemTitleRow}>
-          {isQueued ? (
-            <Checkbox
-              checked={selected}
-              onToggle={onToggle}
-              label={`Select receipt ${item.receipt.transactionType} ${item.receipt.transactionNumber}`}
-            />
-          ) : (
-            <Icon
-              name={isFailed ? 'alert-circle-outline' : 'printer-outline'}
-              size={18}
-              color={isFailed ? Colors.error : Colors.active}
-            />
-          )}
-          <Text style={styles.itemTitle}>
-            {item.receipt.transactionType} {item.receipt.transactionNumber}
+      <View style={styles.itemRow}>
+        {/* Only receipts waiting to print can be selected. */}
+        <Checkbox
+          checked={isQueued && selected}
+          onToggle={onToggle}
+          disabled={!isQueued}
+          label={`Select receipt ${number}`}
+        />
+        <View style={styles.itemBody}>
+          <Text style={styles.itemTitle} numberOfLines={1}>{number}</Text>
+          <Text style={styles.itemDetails} numberOfLines={1}>
+            {receipt.customer?.name || 'No customer name'}
           </Text>
+          <Text style={styles.itemAmount}>{total !== undefined ? `Amount: ${total}` : 'Amount: —'}</Text>
+          <Text style={[styles.itemStatus, { color: statusColor }]}>{statusLabel}</Text>
         </View>
-        <Text style={[styles.itemStatus, { color: statusColor }]}>
-          {statusLabel}
-        </Text>
+        {isPrinting ? (
+          <ActivityIndicator color={Colors.active} />
+        ) : (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`${isFailed ? 'Retry' : 'Print'} receipt ${receipt.transactionNumber}`}
+            disabled={printBusy}
+            style={({ pressed }) => [styles.rowPrintBtn, printBusy && styles.actionBtnDisabled, pressed && styles.actionBtnPressed]}
+            onPress={isFailed ? onRetry : onPrint}>
+            <Icon name="printer-outline" size={16} color="#fff" />
+            <Text style={styles.rowPrintText}>{isFailed ? 'Retry' : 'Print'}</Text>
+          </Pressable>
+        )}
       </View>
-      <Text style={styles.itemDetails}>
-        Customer: {item.receipt.customer?.name || 'N/A'} {'\n'}
-        Amount: {item.receipt.financials?.total ?? '—'}
-      </Text>
-      {item.error ? (
-        <Text style={styles.itemError}>{item.error}</Text>
-      ) : null}
-      <Text style={styles.itemDate}>
-        Queued at: {new Date(item.queuedAt).toLocaleTimeString()}
-      </Text>
-      {isQueued && (
-        <View style={styles.rowActions}>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={`Cancel receipt ${item.receipt.transactionNumber}`}
-            style={({ pressed }) => [styles.cancelQueueBtn, pressed && styles.actionBtnPressed]}
-            onPress={() => Alert.alert(
-              'Cancel queued receipt?',
-              'This receipt will be removed from the print queue. Its source CSV will remain in Incoming.',
-              [
-                { text: 'Keep queued', style: 'cancel' },
-                {
-                  text: 'Cancel receipt', style: 'destructive', onPress: () => {
-                    if (!cancelQueueItem(item.identity)) {
-                      Alert.alert('Printing already started', 'Cancellation is unavailable after printing begins.');
-                    }
-                  }
-                },
-              ],
-            )}>
-            <Text style={styles.cancelQueueText}>Cancel</Text>
-          </Pressable>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={`Print receipt ${item.receipt.transactionNumber}`}
-            disabled={printBusy}
-            style={({ pressed }) => [styles.rowPrintBtn, printBusy && styles.actionBtnDisabled, pressed && styles.actionBtnPressed]}
-            onPress={onPrint}>
-            <Icon name="printer-outline" size={16} color="#fff" />
-            <Text style={styles.rowPrintText}>Print</Text>
-          </Pressable>
-        </View>
-      )}
-      {isFailed && (
-        <View style={styles.rowActions}>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={`Retry receipt ${item.receipt.transactionNumber}`}
-            disabled={printBusy}
-            style={({ pressed }) => [styles.rowPrintBtn, printBusy && styles.actionBtnDisabled, pressed && styles.actionBtnPressed]}
-            onPress={onRetry}>
-            <Icon name="printer-outline" size={16} color="#fff" />
-            <Text style={styles.rowPrintText}>Retry</Text>
-          </Pressable>
-        </View>
-      )}
-      {isPrinting && <Text style={styles.itemError}>Printing has started; cancellation is unavailable.</Text>}
+      {isFailed && item.error ? <Text style={styles.itemError}>{item.error}</Text> : null}
     </View>
   );
 }
@@ -383,36 +302,7 @@ const styles = StyleSheet.create({
     borderBottomColor: Colors.border,
     ...Shadow.sm,
   },
-  statsRow: {
-    flexDirection: 'row',
-    gap: Spacing.md,
-    marginBottom: Spacing.md,
-  },
-  statBox: {
-    flex: 1,
-    backgroundColor: Colors.background,
-    padding: Spacing.sm,
-    borderRadius: BorderRadius.sm,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    alignItems: 'center',
-  },
-  statLabel: {
-    ...Typography.captionMedium,
-    color: Colors.textSecondary,
-    textTransform: 'uppercase',
-  },
-  statValue: {
-    ...Typography.title,
-    color: Colors.textPrimary,
-    marginTop: 2,
-  },
-  actionsRow: {
-    flexDirection: 'row',
-    gap: Spacing.md,
-  },
   actionBtn: {
-    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -434,49 +324,15 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontWeight: '600',
   },
-  retryBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: Spacing.xs,
-    backgroundColor: Colors.errorDim,
-    borderWidth: 1,
-    borderColor: `${Colors.error}55`,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.xs,
-    borderRadius: BorderRadius.md,
-  },
-  retryBtnText: {
-    ...Typography.bodyMedium,
-    color: Colors.error,
-    fontWeight: '600',
-  },
-  printAllBtn: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: Spacing.md,
-    borderRadius: BorderRadius.md,
-    borderWidth: 1,
-    borderColor: `${Colors.primary}88`,
-  },
-  printAllText: { ...Typography.bodyMedium, color: Colors.primaryLight, fontWeight: '600' },
-  outlineDisabled: { opacity: 0.4 },
   selectionRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: Spacing.sm,
-    marginTop: Spacing.sm,
+    marginBottom: Spacing.sm,
   },
   selectAllText: { ...Typography.captionMedium, color: Colors.primaryLight },
-  selectionCount: { ...Typography.caption, color: Colors.textSecondary, flex: 1, textAlign: 'center' },
-  rowActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-    gap: Spacing.sm,
-    marginTop: Spacing.sm,
-  },
+  selectionCount: { ...Typography.caption, color: Colors.textSecondary },
   rowPrintBtn: {
     minHeight: 44,
     flexDirection: 'row',
@@ -488,6 +344,11 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.primary,
   },
   rowPrintText: { ...Typography.bodyMedium, color: '#fff', fontWeight: '600' },
+  dimmed: { opacity: 0.4 },
+  printerHint: { ...Typography.caption, color: Colors.textTertiary, textAlign: 'center', marginTop: Spacing.xs },
+  itemRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.sm },
+  itemBody: { flex: 1 },
+  itemAmount: { ...Typography.caption, color: Colors.textSecondary },
   listContent: {
     padding: Spacing.base,
     gap: Spacing.sm,
@@ -525,24 +386,11 @@ const styles = StyleSheet.create({
     borderColor: `${Colors.active}55`,
     backgroundColor: `${Colors.active}11`,
   },
-  itemHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: Spacing.xs,
-  },
-  itemTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.xs,
-  },
   itemTitle: {
     ...Typography.bodyMedium,
     color: Colors.textPrimary,
     fontWeight: '600',
   },
-  cancelQueueBtn: { minHeight: 44, justifyContent: 'center', paddingHorizontal: Spacing.lg, borderRadius: BorderRadius.sm, borderWidth: 1, borderColor: Colors.borderLight },
-  cancelQueueText: { ...Typography.bodyMedium, color: Colors.error, fontWeight: '600' },
   itemStatus: {
     ...Typography.captionMedium,
     color: Colors.textSecondary,
@@ -556,19 +404,12 @@ const styles = StyleSheet.create({
   itemDetails: {
     ...Typography.caption,
     color: Colors.textSecondary,
-    marginBottom: Spacing.xs,
   },
   itemError: {
     ...Typography.caption,
     color: Colors.error,
     marginTop: Spacing.xs,
     marginBottom: Spacing.xs,
-  },
-  itemDate: {
-    ...Typography.caption,
-    color: Colors.textTertiary,
-    fontSize: 10,
-    marginTop: Spacing.xs,
   },
   deferredSection: {
     marginBottom: Spacing.base,
