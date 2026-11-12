@@ -12,10 +12,12 @@
  * State actions delegate to GoogleAuthService and DriveService.
  */
 
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  LayoutAnimation,
   Platform,
   Pressable,
   RefreshControl,
@@ -164,6 +166,24 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
     f => fileStatuses[f.id] === 'NEW' || fileStatuses[f.id] === 'READY',
   ).length;
   const busy = Boolean(processingFileId) || parseLoading;
+
+  // Smoothly reflow the page when cards appear, move between sections or
+  // leave. Must be scheduled before React renders the change, so it listens to
+  // the store directly instead of running in a post-render effect.
+  useEffect(
+    () =>
+      useAppStore.subscribe((state, prev) => {
+        if (
+          state.csvFiles !== prev.csvFiles ||
+          state.archiveFiles !== prev.archiveFiles ||
+          state.queue !== prev.queue ||
+          state.receipts !== prev.receipts
+        ) {
+          LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+        }
+      }),
+    [],
+  );
 
   const describeResult = (result: EnqueueResult) => {
     const plural = (n: number) => `${n} receipt${n === 1 ? '' : 's'}`;
@@ -333,7 +353,7 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
         ) : null}
 
         {notice ? (
-          <View style={styles.noticeBanner}>
+          <FadeIn style={styles.noticeBanner}>
             <Icon name="check-circle-outline" size={18} color={Colors.active} />
             <Text style={styles.noticeText}>{notice}</Text>
             {queuedCount > 0 ? (
@@ -346,7 +366,7 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
                 <Text style={styles.secondaryBtnText}>Print Now ({queuedCount})</Text>
               </Pressable>
             ) : null}
-          </View>
+          </FadeIn>
         ) : null}
 
         {!foldersReady ? foldersCard : null}
@@ -569,10 +589,18 @@ function FolderLine({
   );
 }
 
-function StatusLine({status, label}: {status: CsvDisplayStatus | ReceiptRowStatus; label: string}) {
+function StatusLine({
+  status,
+  label,
+  active = status === 'PRINTING',
+}: {
+  status: CsvDisplayStatus | ReceiptRowStatus;
+  label: string;
+  active?: boolean;
+}) {
   return (
     <View style={styles.statusLine}>
-      <View style={[styles.statusPip, {backgroundColor: STATUS_COLOR[status]}]} />
+      <StatusPip color={STATUS_COLOR[status]} active={active} />
       <Text style={[styles.statusLabel, {color: STATUS_COLOR[status]}]}>{label}</Text>
     </View>
   );
@@ -622,6 +650,48 @@ function fileStatusDescription(status: CsvDisplayStatus, progress?: CsvProgress)
   }
 }
 
+/** Subtle entrance: fade in and rise a few pixels. */
+function FadeIn({style, children}: {style?: object; children: React.ReactNode}) {
+  const progress = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const anim = Animated.timing(progress, {toValue: 1, duration: 220, useNativeDriver: true});
+    anim.start();
+    return () => anim.stop();
+  }, [progress]);
+  return (
+    <Animated.View
+      style={[
+        style,
+        {
+          opacity: progress,
+          transform: [{translateY: progress.interpolate({inputRange: [0, 1], outputRange: [8, 0]})}],
+        },
+      ]}>
+      {children}
+    </Animated.View>
+  );
+}
+
+/** Status dot that gently pulses while work is in progress. */
+function StatusPip({color, active}: {color: string; active: boolean}) {
+  const pulse = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    if (!active) {
+      pulse.setValue(1);
+      return;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, {toValue: 0.3, duration: 600, useNativeDriver: true}),
+        Animated.timing(pulse, {toValue: 1, duration: 600, useNativeDriver: true}),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [active, pulse]);
+  return <Animated.View style={[styles.statusPip, {backgroundColor: color, opacity: pulse}]} />;
+}
+
 function IncomingFileCard({
   file,
   status,
@@ -645,7 +715,7 @@ function IncomingFileCard({
   const canProcess = status === 'NEW' || status === 'READY';
   const canRetryArchive = status === 'ARCHIVE_PENDING' && progress?.archiveStatus === 'FAILED';
   return (
-    <View style={styles.card}>
+    <FadeIn style={styles.card}>
       <View style={styles.fileHeader}>
         <Icon name="file-document-outline" size={22} color={Colors.primaryLight} />
         <View style={styles.flex}>
@@ -654,7 +724,11 @@ function IncomingFileCard({
         </View>
       </View>
       <View style={styles.cardBody}>
-        <StatusLine status={status} label={processing ? 'Processing…' : CSV_STATUS_LABEL[status]} />
+        <StatusLine
+          status={status}
+          label={processing ? 'Processing…' : CSV_STATUS_LABEL[status]}
+          active={processing || status === 'PRINTING'}
+        />
         <Text style={styles.statusDesc}>
           {processing ? 'Reading the file and adding its receipts to the print queue.' : fileStatusDescription(status, progress)}
         </Text>
@@ -679,7 +753,7 @@ function IncomingFileCard({
           <RetryArchiveButton retrying={retrying} onPress={onRetryArchive} />
         ) : null}
       </View>
-    </View>
+    </FadeIn>
   );
 }
 
@@ -744,7 +818,7 @@ function ReceiptGroupCard({
   const showPrintNow = group.status === 'QUEUED' || group.status === 'PRINTING';
   const showQueueLink = group.status === 'PRINT_FAILED';
   return (
-    <View style={styles.card}>
+    <FadeIn style={styles.card}>
       <View style={styles.fileHeader}>
         <Icon name="layers-outline" size={22} color={Colors.primaryLight} />
         <View style={styles.flex}>
@@ -831,7 +905,7 @@ function ReceiptGroupCard({
           ) : null}
         </View>
       ) : null}
-    </View>
+    </FadeIn>
   );
 }
 
