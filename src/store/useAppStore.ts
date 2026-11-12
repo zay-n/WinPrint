@@ -236,7 +236,14 @@ export interface CsvProgress {
   printedCount: number;
   archiveStatus: 'PENDING' | 'ARCHIVING' | 'ARCHIVED' | 'FAILED';
   archiveError?: string;
+  /** When the move to the Printed folder succeeded. */
+  archivedAt?: number;
 }
+
+/** Just-archived CSVs are hidden from Incoming for this long (stale Drive listing guard). */
+const ARCHIVE_LISTING_GRACE_MS = 60_000;
+export const INTERRUPTED_PRINT_ERROR =
+  'Printing was interrupted before it was confirmed. Check whether this receipt printed, then retry if needed.';
 
 export interface ReprintAttempt {
   identity: string;
@@ -264,6 +271,8 @@ interface QueueActions {
   resumePendingArchives: () => Promise<void>;
   clearHistory: () => void;
   processQueue: () => Promise<void>;
+  /** After a restart: receipts left in PRINTING become FAILED (retryable, never auto-reprinted). */
+  recoverInterruptedPrints: () => number;
   reprintReceipt: (identity: string) => Promise<PrintResult>;
 }
 
@@ -798,8 +807,15 @@ export const useAppStore = create<AppStore>()(
         try {
           const listed = (await DriveService.listCsvFiles(sourceFolderId)) ?? [];
           const progress = get().csvProgress;
-          // Never show an already-archived CSV as incoming (stale listing guard).
-          const csvFiles = listed.filter(f => progress[f.id]?.archiveStatus !== 'ARCHIVED');
+          // The current Drive folder decides where a file appears. Only hide a
+          // CSV archived moments ago (the listing can briefly lag the move); an
+          // archived CSV that was moved back to Incoming must stay visible.
+          const now = Date.now();
+          const csvFiles = listed.filter(f => {
+            const p = progress[f.id];
+            return !(p?.archiveStatus === 'ARCHIVED' && p.archivedAt !== undefined &&
+              now - p.archivedAt < ARCHIVE_LISTING_GRACE_MS);
+          });
           set({ csvFiles, csvLoading: false, driveAccessChecked: true, driveNeedsReauth: false });
         } catch (e: unknown) {
           const isDriveAuthError = e instanceof DriveAuthError;
@@ -1411,7 +1427,7 @@ export const useAppStore = create<AppStore>()(
             driveNeedsReauth: false,
             csvProgress: {
               ...state.csvProgress,
-              [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'ARCHIVED', archiveError: undefined }
+              [driveFileId]: { ...state.csvProgress[driveFileId], archiveStatus: 'ARCHIVED', archiveError: undefined, archivedAt: Date.now() }
             },
             // Completed: drop the CSV and its parsed receipts from active sections.
             // Printed history (queue) is kept for History and Reprint.
@@ -1521,6 +1537,24 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
+      recoverInterruptedPrints: () => {
+        // Only valid when nothing is printing in this app session.
+        if (queueProcessingInFlight || get().printLoading) return 0;
+        let recovered = 0;
+        set(state => {
+          const queue = state.queue.map(item => {
+            if (item.status !== 'PRINTING') return item;
+            recovered++;
+            return { ...item, status: 'FAILED' as PrintStatus, error: INTERRUPTED_PRINT_ERROR, completedAt: Date.now() };
+          });
+          return recovered > 0 ? { queue } : state;
+        });
+        if (recovered > 0) {
+          console.warn(`[WinPrint][Queue] recoverInterruptedPrints: ${recovered} interrupted receipt(s) marked FAILED`);
+        }
+        return recovered;
+      },
+
       reprintReceipt: async (identity: string) => {
         const item = get().queue.find(entry => entry.identity === identity && entry.status === 'PRINTED');
         if (!item) return { success: false, error: 'This printed receipt is no longer available in history.' };
@@ -1613,7 +1647,7 @@ export const useAppStore = create<AppStore>()(
         }),
 
       enqueueDeferredFile: async (entry: string): Promise<boolean> => {
-        const { sourceFolderId, enqueueReceipt, removeDeferredFileId, user } = get();
+        const { sourceFolderId, removeDeferredFileId, user } = get();
         if (!user) {
           set({ deferredError: 'Cannot enqueue deferred file: Not signed in.' });
           return false;
@@ -1681,14 +1715,19 @@ export const useAppStore = create<AppStore>()(
           // prepareCsvForQueue guards against null/empty/root folderId internally.
           // Pass folderId ?? '' so TypeScript is satisfied; the guard rejects empty strings quietly.
           get().prepareCsvForQueue(fileId, folderId ?? '', receipts.length);
-          for (const receipt of receipts) {
-            enqueueReceipt(receipt);
-          }
+          const { added } = get().enqueueReceipts(receipts);
 
           // Successfully enqueued â€” remove from deferred list
           set({ driveAccessChecked: true, driveNeedsReauth: false });
           removeDeferredFileId(entry);
-          set({ deferredLoadingId: null, deferredError: null });
+          set({
+            deferredLoadingId: null,
+            // Nothing was queued: say so instead of silently dropping the card.
+            deferredError: added === 0
+              ? `"${targetFile.name}" was already printed or is already in the queue. Nothing was added. ` +
+                'To print a copy, use History > Reprint.'
+              : null,
+          });
           return true;
         } catch (e: unknown) {
           const isDriveAuthError = e instanceof DriveAuthError;
@@ -1748,6 +1787,9 @@ export const useAppStore = create<AppStore>()(
         onboardingStep: state.onboardingStep,
       }),
       onRehydrateStorage: () => (state) => {
+        // A print cannot survive an app restart: a persisted PRINTING item
+        // would otherwise be stuck forever (never printed, retried or cancelled).
+        state?.recoverInterruptedPrints();
         state?.setHasHydrated(true);
       },
     }

@@ -135,9 +135,9 @@ describe('Process CSV (one step) + Enqueue All', () => {
     expect(DriveService.downloadAndParseCsv).toHaveBeenCalledTimes(1);
   });
 
-  it('a stale Incoming listing never shows a completed CSV', async () => {
+  it('a stale Incoming listing right after archiving does not show the completed CSV', async () => {
     useAppStore.setState({
-      csvProgress: {f1: {driveFileId: 'f1', sourceFolderId: 'src', expectedCount: 1, printedCount: 1, archiveStatus: 'ARCHIVED'}},
+      csvProgress: {f1: {driveFileId: 'f1', sourceFolderId: 'src', expectedCount: 1, printedCount: 1, archiveStatus: 'ARCHIVED', archivedAt: Date.now()}},
     });
     (DriveService.listCsvFiles as jest.Mock).mockResolvedValue([file]);
     await st().loadCsvFiles();

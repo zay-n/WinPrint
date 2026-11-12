@@ -16,7 +16,9 @@ export type CsvDisplayStatus =
   | 'PRINTING'
   | 'PRINT_FAILED'
   | 'ARCHIVE_PENDING'
-  | 'COMPLETED';
+  | 'COMPLETED'
+  /** Printed + archived earlier, but the file is in the Incoming folder again. */
+  | 'RETURNED';
 
 export const CSV_STATUS_LABEL: Record<CsvDisplayStatus, string> = {
   NEW: 'Waiting to be processed',
@@ -26,6 +28,7 @@ export const CSV_STATUS_LABEL: Record<CsvDisplayStatus, string> = {
   PRINT_FAILED: 'Print Failed',
   ARCHIVE_PENDING: 'Archive Pending',
   COMPLETED: 'Completed',
+  RETURNED: 'Already Printed',
 };
 
 export type ReceiptRowStatus = 'READY' | PrintStatus;

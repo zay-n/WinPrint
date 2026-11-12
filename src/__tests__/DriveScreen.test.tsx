@@ -71,7 +71,9 @@ describe('DriveScreen workflow', () => {
     });
     t = texts(tree);
     expect(useAppStore.getState().queue).toHaveLength(2);
-    expect(t).toContain('2 receipts added to the print queue.');
+    expect(t).toContain('2 receipts added to the print queue. Not printed yet — tap Print Now.');
+    // Queued is not printed: nothing has been sent to the printer yet.
+    expect(useAppStore.getState().queue.every(q => q.status === 'QUEUED')).toBe(true);
     expect(t).toContain('No files waiting to be processed');
     expect(t).toContain('2 receipts to print from 1 file');
     expect(t).toContain('INVOICE 1');

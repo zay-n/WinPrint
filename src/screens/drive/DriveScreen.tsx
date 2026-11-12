@@ -75,6 +75,8 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   const processCsv = useAppStore(s => s.processCsv);
   const enqueueReceipts = useAppStore(s => s.enqueueReceipts);
   const retryArchive = useAppStore(s => s.retryArchive);
+  const processQueue = useAppStore(s => s.processQueue);
+  const printLoading = useAppStore(s => s.printLoading);
   const processingFileId = useAppStore(s => s.processingFileId);
   const parseLoading = useAppStore(s => s.parseLoading);
   const csvError = useAppStore(s => s.csvError);
@@ -146,12 +148,18 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   const fileStatuses = useMemo(() => {
     const map: Record<string, CsvDisplayStatus> = {};
     csvFiles.forEach(f => {
-      map[f.id] = csvDisplayStatus(f.id, queue, csvProgress, lastParsedFileId);
+      const status = csvDisplayStatus(f.id, queue, csvProgress, lastParsedFileId);
+      // Drive says the file is in Incoming right now, so it is shown here even
+      // if it was archived before (someone moved it back). Its printed history
+      // is kept, so it is not offered for processing again.
+      map[f.id] = status === 'COMPLETED' ? 'RETURNED' : status;
     });
     return map;
   }, [csvFiles, queue, csvProgress, lastParsedFileId]);
-  // Completed CSVs never appear as incoming, even on a stale listing.
-  const incomingFiles = csvFiles.filter(f => fileStatuses[f.id] !== 'COMPLETED');
+  const incomingFiles = csvFiles;
+  // A file is listed in one section only: Incoming wins when Drive reports it there.
+  const completedFiles = archiveFiles.filter(f => !csvFiles.some(c => c.id === f.id));
+  const queuedCount = queue.filter(q => q.status === 'QUEUED').length;
   const waitingCount = incomingFiles.filter(
     f => fileStatuses[f.id] === 'NEW' || fileStatuses[f.id] === 'READY',
   ).length;
@@ -163,7 +171,7 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
       return `No new receipts added — all ${plural(result.total)} were already queued or printed.`;
     }
     return (
-      `${plural(result.added)} added to the print queue.` +
+      `${plural(result.added)} added to the print queue. Not printed yet — tap Print Now.` +
       (result.skipped > 0 ? ` ${result.skipped} already queued or printed.` : '')
     );
   };
@@ -190,6 +198,13 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   };
 
   const openQueue = () => navigation.navigate('Queue');
+
+  // Explicit print action: runs the existing queue processor (single-flight).
+  const handlePrintNow = () => {
+    if (printLoading || queuedCount === 0) return;
+    setNotice(null);
+    void processQueue();
+  };
 
   const openReceipt = (row: ReceiptRow) => {
     if (row.inQueue) {
@@ -270,7 +285,7 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
       </View>
     </>
   );
-  const completedShown = showAllCompleted ? archiveFiles : archiveFiles.slice(0, 5);
+  const completedShown = showAllCompleted ? completedFiles : completedFiles.slice(0, 5);
 
   return (
     <SafeAreaView style={styles.safe} edges={['bottom']}>
@@ -321,12 +336,16 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
           <View style={styles.noticeBanner}>
             <Icon name="check-circle-outline" size={18} color={Colors.active} />
             <Text style={styles.noticeText}>{notice}</Text>
-            <Pressable
-              onPress={openQueue}
-              style={({pressed}) => [styles.secondaryBtn, pressed && styles.pressed]}
-              accessibilityLabel="Open Print Queue">
-              <Text style={styles.secondaryBtnText}>Open Print Queue</Text>
-            </Pressable>
+            {queuedCount > 0 ? (
+              <Pressable
+                onPress={handlePrintNow}
+                disabled={printLoading}
+                style={({pressed}) => [styles.secondaryBtn, (pressed || printLoading) && styles.pressed]}
+                accessibilityRole="button"
+                accessibilityLabel="Print queued receipts now">
+                <Text style={styles.secondaryBtnText}>Print Now ({queuedCount})</Text>
+              </Pressable>
+            ) : null}
           </View>
         ) : null}
 
@@ -413,6 +432,9 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
                   retrying={retryingId === group.fileId}
                   onAddToQueue={() => handleAddToQueue(group)}
                   onOpenQueue={openQueue}
+                  onPrintNow={handlePrintNow}
+                  printing={printLoading}
+                  queuedCount={queuedCount}
                   onRetryArchive={() => void handleRetryArchive(group.fileId)}
                   onOpenReceipt={openReceipt}
                 />
@@ -425,12 +447,12 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
                 <SectionHeading
                   title="Completed"
                   subtitle={
-                    archiveFiles.length > 0
-                      ? `${archiveFiles.length} file${archiveFiles.length === 1 ? '' : 's'} printed and moved to the Printed folder`
+                    completedFiles.length > 0
+                      ? `${completedFiles.length} file${completedFiles.length === 1 ? '' : 's'} printed and moved to the Printed folder`
                       : 'Printed files will be listed here'
                   }
                 />
-                {archiveFiles.length > 0 ? (
+                {completedFiles.length > 0 ? (
                   <View style={styles.card}>
                     {completedShown.map((f, i) => (
                       <View key={f.id} style={[styles.completedRow, i > 0 && styles.rowDivider]}>
@@ -439,12 +461,12 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
                         <Text style={styles.completedLabel}>Completed</Text>
                       </View>
                     ))}
-                    {archiveFiles.length > 5 ? (
+                    {completedFiles.length > 5 ? (
                       <Pressable
                         onPress={() => setShowAllCompleted(v => !v)}
                         style={[styles.completedRow, styles.rowDivider]}>
                         <Text style={styles.linkText}>
-                          {showAllCompleted ? 'Show fewer' : `Show all ${archiveFiles.length}`}
+                          {showAllCompleted ? 'Show fewer' : `Show all ${completedFiles.length}`}
                         </Text>
                       </Pressable>
                     ) : null}
@@ -493,6 +515,7 @@ const STATUS_COLOR: Record<CsvDisplayStatus | ReceiptRowStatus, string> = {
   CANCELLED: Colors.textTertiary,
   ARCHIVE_PENDING: Colors.warning,
   COMPLETED: Colors.active,
+  RETURNED: Colors.textSecondary,
   PRINTED: Colors.active,
 };
 
@@ -589,6 +612,11 @@ function fileStatusDescription(status: CsvDisplayStatus, progress?: CsvProgress)
       return progress?.archiveStatus === 'FAILED'
         ? 'All receipts printed, but the file could not be moved to the Printed folder.'
         : 'All receipts printed. Moving the file to the Printed folder…';
+    case 'RETURNED':
+      return (
+        'This file was printed and archived earlier, then moved back to Incoming. ' +
+        'Its receipts will not print again automatically. To print a copy, use History > Reprint.'
+      );
     default:
       return '';
   }
@@ -677,7 +705,7 @@ function groupDescription(group: ReceiptGroup): string {
     case 'READY':
       return 'Not in the print queue yet.';
     case 'QUEUED':
-      return 'Waiting in the print queue. Open the Print Queue to start printing.';
+      return 'Added to the print queue. Not printed yet — tap Print Now.';
     case 'PRINTING':
       return 'Printing now.';
     case 'PRINT_FAILED':
@@ -696,6 +724,9 @@ function ReceiptGroupCard({
   retrying,
   onAddToQueue,
   onOpenQueue,
+  onPrintNow,
+  printing,
+  queuedCount,
   onRetryArchive,
   onOpenReceipt,
 }: {
@@ -703,11 +734,15 @@ function ReceiptGroupCard({
   retrying: boolean;
   onAddToQueue: () => void;
   onOpenQueue: () => void;
+  onPrintNow: () => void;
+  printing: boolean;
+  queuedCount: number;
   onRetryArchive: () => void;
   onOpenReceipt: (row: ReceiptRow) => void;
 }) {
   const count = group.rows.length;
-  const showQueueLink = group.status === 'QUEUED' || group.status === 'PRINT_FAILED';
+  const showPrintNow = group.status === 'QUEUED' || group.status === 'PRINTING';
+  const showQueueLink = group.status === 'PRINT_FAILED';
   return (
     <View style={styles.card}>
       <View style={styles.fileHeader}>
@@ -753,7 +788,7 @@ function ReceiptGroupCard({
         );
       })}
 
-      {group.notQueued.length > 0 || showQueueLink || group.archiveFailed ? (
+      {group.notQueued.length > 0 || showPrintNow || showQueueLink || group.archiveFailed ? (
         <View style={[styles.cardBody, styles.rowDivider]}>
           {group.notQueued.length > 0 ? (
             <Pressable
@@ -762,6 +797,23 @@ function ReceiptGroupCard({
               accessibilityLabel="Add all to Print Queue">
               <Text style={styles.primaryBtnText}>
                 Add {group.notQueued.length} to Print Queue
+              </Text>
+            </Pressable>
+          ) : null}
+          {showPrintNow ? (
+            <Pressable
+              style={({pressed}) => [styles.primaryBtn, printing && styles.btnDisabled, pressed && styles.pressed]}
+              onPress={onPrintNow}
+              disabled={printing}
+              accessibilityRole="button"
+              accessibilityLabel="Print queued receipts now">
+              {printing ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Icon name="printer-outline" size={18} color="#fff" />
+              )}
+              <Text style={styles.primaryBtnText}>
+                {printing ? 'Printing… confirm on the print screen' : `Print Now (${queuedCount})`}
               </Text>
             </Pressable>
           ) : null}
