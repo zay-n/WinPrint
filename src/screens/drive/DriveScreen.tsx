@@ -4,19 +4,20 @@
  * Phase 2–4: Allows the user to:
  *  1. Sign in with Google
  *  2. Browse and select the Winsoft CSV source folder and Archive folder
- *  3. View CSV files in the selected folder
- *  4. Parse CSV files and enqueue transactions
+ *  3. Incoming CSV Files — one-step "Process CSV" (download, parse, enqueue)
+ *  4. Receipts Ready to Print — live status of extracted receipts
+ *  5. Completed — CSVs printed and moved to the Printed folder
  *
  * State lives in useAppStore (Zustand).
  * State actions delegate to GoogleAuthService and DriveService.
  */
 
-import React, {useCallback, useEffect, useState} from 'react';
+import React, {useEffect, useMemo, useState} from 'react';
 import {
   ActivityIndicator,
-  FlatList,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -26,7 +27,15 @@ import {SafeAreaView} from 'react-native-safe-area-context';
 import Icon from '../../components/Icon';
 import DriveFolderPickerModal from '../../components/DriveFolderPickerModal';
 import {Colors, Spacing, BorderRadius, Typography, Shadow} from '../../theme';
-import {useAppStore, csvWorkflowState} from '../../store/useAppStore';
+import {useAppStore} from '../../store/useAppStore';
+import type {CsvProgress, EnqueueResult} from '../../store/useAppStore';
+import {
+  buildReceiptGroups,
+  csvDisplayStatus,
+  CSV_STATUS_LABEL,
+  RECEIPT_STATUS_LABEL,
+} from '../../store/driveWorkflow';
+import type {CsvDisplayStatus, ReceiptGroup, ReceiptRow, ReceiptRowStatus} from '../../store/driveWorkflow';
 import type {DriveFile} from '../../services/drive/DriveClient';
 import type {DriveScreenProps} from '../../navigation/types';
 
@@ -42,8 +51,6 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   const signIn = useAppStore(s => s.signIn);
   const signOut = useAppStore(s => s.signOut);
 
-  const folders = useAppStore(s => s.folders);
-  const foldersLoading = useAppStore(s => s.foldersLoading);
   const csvFiles = useAppStore(s => s.csvFiles);
   const csvLoading = useAppStore(s => s.csvLoading);
   const sourceFolderId = useAppStore(s => s.sourceFolderId);
@@ -53,30 +60,28 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
   const archiveFolderName = useAppStore(s => s.archiveFolderName);
   const archiveFolderPath = useAppStore(s => s.archiveFolderPath);
   const driveError = useAppStore(s => s.driveError);
-  const loadFolders = useAppStore(s => s.loadFolders);
   const selectFolder = useAppStore(s => s.selectFolder);
   const selectArchiveFolder = useAppStore(s => s.selectArchiveFolder);
   const loadCsvFiles = useAppStore(s => s.loadCsvFiles);
+  const loadArchiveFiles = useAppStore(s => s.loadArchiveFiles);
+  const refreshDriveListings = useAppStore(s => s.refreshDriveListings);
 
-  const downloadAndParse = useAppStore(s => s.downloadAndParse);
   const receipts = useAppStore(s => s.receipts);
   const queue = useAppStore(s => s.queue);
   const csvProgress = useAppStore(s => s.csvProgress);
   const lastParsedFileId = useAppStore(s => s.lastParsedFileId);
   const archiveFiles = useAppStore(s => s.archiveFiles);
-  const loadArchiveFiles = useAppStore(s => s.loadArchiveFiles);
-  const parsedState = lastParsedFileId
-    ? csvWorkflowState(lastParsedFileId, queue, csvProgress, lastParsedFileId)
-    : 'NEW';
-  const canEnqueue = parsedState === 'PARSED';
-  const stateLabel: Record<string, string> = {
-    PARSED: 'Parsed', QUEUED: 'Queued', PRINTING: 'Printing', PRINTED: 'Printed', ARCHIVED: 'Archived',
-  };
-  const enqueueReceipt = useAppStore(s => s.enqueueReceipt);
+  const processCsv = useAppStore(s => s.processCsv);
+  const enqueueReceipts = useAppStore(s => s.enqueueReceipts);
+  const retryArchive = useAppStore(s => s.retryArchive);
+  const processingFileId = useAppStore(s => s.processingFileId);
   const parseLoading = useAppStore(s => s.parseLoading);
   const csvError = useAppStore(s => s.csvError);
 
   const [pickerMode, setPickerMode] = useState<'source' | 'archive' | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [showAllCompleted, setShowAllCompleted] = useState(false);
 
   // Automatically load CSV files when a source folder is configured
   useEffect(() => {
@@ -91,12 +96,69 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
     }
   }, [user, archiveFolderId, loadArchiveFiles]);
 
-  const handleDownload = useCallback(
-    (file: DriveFile) => {
-      downloadAndParse(file);
-    },
-    [downloadAndParse],
+  const groups = useMemo(
+    () => buildReceiptGroups(queue, csvProgress, receipts, lastParsedFileId),
+    [queue, csvProgress, receipts, lastParsedFileId],
   );
+  const activeReceiptCount = groups.reduce(
+    (n, g) => n + g.rows.filter(r => r.status !== 'PRINTED').length,
+    0,
+  );
+  const fileStatuses = useMemo(() => {
+    const map: Record<string, CsvDisplayStatus> = {};
+    csvFiles.forEach(f => {
+      map[f.id] = csvDisplayStatus(f.id, queue, csvProgress, lastParsedFileId);
+    });
+    return map;
+  }, [csvFiles, queue, csvProgress, lastParsedFileId]);
+  // Completed CSVs never appear as incoming, even on a stale listing.
+  const incomingFiles = csvFiles.filter(f => fileStatuses[f.id] !== 'COMPLETED');
+  const waitingCount = incomingFiles.filter(
+    f => fileStatuses[f.id] === 'NEW' || fileStatuses[f.id] === 'READY',
+  ).length;
+  const busy = Boolean(processingFileId) || parseLoading;
+
+  const describeResult = (result: EnqueueResult) => {
+    const plural = (n: number) => `${n} receipt${n === 1 ? '' : 's'}`;
+    if (result.added === 0) {
+      return `No new receipts added — all ${plural(result.total)} were already queued or printed.`;
+    }
+    return (
+      `${plural(result.added)} added to the print queue.` +
+      (result.skipped > 0 ? ` ${result.skipped} already queued or printed.` : '')
+    );
+  };
+
+  const handleProcess = async (file: DriveFile) => {
+    if (busy) return;
+    setNotice(null);
+    const result = await processCsv(file);
+    if (result) setNotice(describeResult(result));
+  };
+
+  const handleAddToQueue = (group: ReceiptGroup) => {
+    setNotice(describeResult(enqueueReceipts(group.notQueued)));
+  };
+
+  const handleRetryArchive = async (fileId: string) => {
+    if (retryingId) return;
+    setRetryingId(fileId);
+    try {
+      await retryArchive(fileId);
+    } finally {
+      setRetryingId(null);
+    }
+  };
+
+  const openQueue = () => navigation.navigate('Queue');
+
+  const openReceipt = (row: ReceiptRow) => {
+    if (row.inQueue) {
+      navigation.navigate('QueuedReceipt', {identity: row.identity});
+    } else if (row.parsedIndex !== undefined) {
+      navigation.navigate('TransactionDetail', {receiptIndex: row.parsedIndex});
+    }
+  };
 
   // ── Not signed in ─────────────────────────────────────────────────────────
 
@@ -148,12 +210,45 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
 
   // ── Signed in ─────────────────────────────────────────────────────────────
 
+  const foldersReady = Boolean(sourceFolderId && archiveFolderId);
+  const foldersCard = (
+    <>
+      <SectionHeading title="Drive Folders" />
+      <View style={styles.card}>
+        <FolderLine
+          label="Incoming"
+          name={sourceFolderName}
+          path={sourceFolderPath}
+          onPress={() => setPickerMode('source')}
+        />
+        <View style={styles.divider} />
+        <FolderLine
+          label="Printed"
+          name={archiveFolderName}
+          path={archiveFolderPath}
+          onPress={() => setPickerMode('archive')}
+        />
+      </View>
+    </>
+  );
+  const completedShown = showAllCompleted ? archiveFiles : archiveFiles.slice(0, 5);
+
   return (
     <SafeAreaView style={styles.safe} edges={['bottom']}>
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
-        showsVerticalScrollIndicator={false}>
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          sourceFolderId ? (
+            <RefreshControl
+              refreshing={csvLoading}
+              onRefresh={() => void refreshDriveListings()}
+              tintColor={Colors.primary}
+              colors={[Colors.primary]}
+            />
+          ) : undefined
+        }>
 
         {/* Connection status */}
         <View style={styles.statusBanner}>
@@ -179,151 +274,141 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
         {csvError ? (
           <View style={styles.errorBanner}>
             <Icon name="alert-circle-outline" size={16} color={Colors.error} />
-            <Text style={styles.errorText}>{csvError}</Text>
+            <Text style={styles.errorText}>Could not process the CSV. {csvError}</Text>
           </View>
         ) : null}
 
-        {/* Source Folder selection */}
-        <SectionLabel title="Incoming Folder (Source)" />
-        {sourceFolderName ? (
-          <View style={styles.selectedFolder}>
-            <Icon name="folder-google-drive" size={20} color="#4285F4" />
-            <View style={styles.folderTextContainer}>
-              <Text style={styles.selectedFolderName} numberOfLines={1}>
-                {sourceFolderName}
-              </Text>
-              {sourceFolderPath ? (
-                <Text style={styles.selectedFolderPath} numberOfLines={1}>
-                  {sourceFolderPath}
-                </Text>
-              ) : null}
-            </View>
+        {notice ? (
+          <View style={styles.noticeBanner}>
+            <Icon name="check-circle-outline" size={18} color={Colors.active} />
+            <Text style={styles.noticeText}>{notice}</Text>
             <Pressable
-              onPress={() => setPickerMode('source')}
-              style={styles.changeBtn}>
-              <Text style={styles.changeBtnText}>Change</Text>
+              onPress={openQueue}
+              style={({pressed}) => [styles.secondaryBtn, pressed && styles.pressed]}
+              accessibilityLabel="Open Print Queue">
+              <Text style={styles.secondaryBtnText}>Open Print Queue</Text>
             </Pressable>
           </View>
-        ) : (
-           <Pressable onPress={() => setPickerMode('source')} style={styles.changeBtnFull}>
-              <Text style={styles.changeBtnText}>Select Incoming Folder</Text>
-           </Pressable>
-        )}
-
-        {/* Archive Folder selection */}
-        <SectionLabel title="Printed Folder (Archive)" />
-        {archiveFolderName ? (
-          <View style={styles.selectedFolder}>
-            <Icon name="folder-google-drive" size={20} color={Colors.active} />
-            <View style={styles.folderTextContainer}>
-              <Text style={styles.selectedFolderName} numberOfLines={1}>
-                {archiveFolderName}
-              </Text>
-              {archiveFolderPath ? (
-                <Text style={styles.selectedFolderPath} numberOfLines={1}>
-                  {archiveFolderPath}
-                </Text>
-              ) : null}
-            </View>
-            <Pressable
-              onPress={() => setPickerMode('archive')}
-              style={styles.changeBtn}>
-              <Text style={styles.changeBtnText}>Change</Text>
-            </Pressable>
-          </View>
-        ) : (
-           <Pressable onPress={() => setPickerMode('archive')} style={styles.changeBtnFull}>
-              <Text style={styles.changeBtnText}>Select Printed Folder</Text>
-           </Pressable>
-        )}
-
-        {archiveFolderId && archiveFiles.length > 0 ? (
-          <>
-            <SectionLabel title={`Printed Files (${archiveFiles.length})`} />
-            {archiveFiles.map(f => (
-              <View key={f.id} style={styles.listRow}>
-                <Icon name="check-circle-outline" size={20} color={Colors.textSecondary} />
-                <Text style={styles.listRowText} numberOfLines={1}>{f.name}</Text>
-                <Text style={styles.receiptSummaryCount}>Archived</Text>
-              </View>
-            ))}
-          </>
         ) : null}
 
-        {/* CSV files */}
+        {!foldersReady ? foldersCard : null}
+
         {sourceFolderId ? (
           <>
-            <SectionLabel
-              title="CSV Files in Folder"
+            {/* ── 1. Incoming CSV Files ── */}
+            <SectionHeading
+              title="Incoming CSV Files"
+              subtitle={
+                waitingCount > 0
+                  ? `${waitingCount} file${waitingCount === 1 ? '' : 's'} waiting to be processed`
+                  : 'No files waiting to be processed'
+              }
               action={
-                <Pressable onPress={loadCsvFiles}>
-                  <Icon name="refresh" size={18} color={Colors.primary} />
+                <Pressable
+                  onPress={() => void refreshDriveListings()}
+                  disabled={csvLoading}
+                  hitSlop={8}
+                  accessibilityLabel="Refresh files">
+                  <Text style={styles.linkText}>Refresh</Text>
                 </Pressable>
               }
             />
-            {csvLoading ? (
-              <ActivityIndicator color={Colors.primary} style={styles.loader} />
+            {csvLoading && incomingFiles.length === 0 ? (
+              <View style={styles.emptyCard}>
+                <ActivityIndicator color={Colors.primary} />
+                <Text style={styles.emptyText}>Checking for new files…</Text>
+              </View>
+            ) : incomingFiles.length === 0 ? (
+              <View style={styles.emptyCard}>
+                <Icon name="cloud-download-outline" size={28} color={Colors.inactive} />
+                <Text style={styles.emptyTitle}>No incoming files</Text>
+                <Text style={styles.emptyText}>
+                  New CSV files in your Incoming folder will appear here.
+                </Text>
+              </View>
             ) : (
-              <FlatList
-                data={csvFiles}
-                keyExtractor={f => f.id}
-                renderItem={({item}) => (
-                  <CsvFileRow
-                    file={item}
-                    loading={parseLoading}
-                    onDownload={() => handleDownload(item)}
-                  />
-                )}
-                scrollEnabled={false}
-                ListEmptyComponent={
-                  <Text style={styles.emptyMsg}>
-                    No CSV files in this folder.
-                  </Text>
-                }
-                ItemSeparatorComponent={() => (
-                  <View style={styles.separator} />
-                )}
-              />
+              incomingFiles.map(file => (
+                <IncomingFileCard
+                  key={file.id}
+                  file={file}
+                  status={fileStatuses[file.id]}
+                  progress={csvProgress[file.id]}
+                  processing={processingFileId === file.id}
+                  disabled={busy}
+                  retrying={retryingId === file.id}
+                  onProcess={() => void handleProcess(file)}
+                  onRetryArchive={() => void handleRetryArchive(file.id)}
+                />
+              ))
             )}
+
+            {/* ── 2. Receipts Ready to Print ── */}
+            <SectionHeading
+              title="Receipts Ready to Print"
+              subtitle={
+                groups.length > 0
+                  ? `${activeReceiptCount} receipt${activeReceiptCount === 1 ? '' : 's'} to print from ${groups.length} file${groups.length === 1 ? '' : 's'}`
+                  : 'Nothing waiting to print'
+              }
+            />
+            {groups.length === 0 ? (
+              <View style={styles.emptyCard}>
+                <Icon name="receipt" size={28} color={Colors.inactive} />
+                <Text style={styles.emptyText}>
+                  Tap Process CSV on an incoming file. Its receipts will show here until they are printed.
+                </Text>
+              </View>
+            ) : (
+              groups.map(group => (
+                <ReceiptGroupCard
+                  key={group.fileId}
+                  group={group}
+                  retrying={retryingId === group.fileId}
+                  onAddToQueue={() => handleAddToQueue(group)}
+                  onOpenQueue={openQueue}
+                  onRetryArchive={() => void handleRetryArchive(group.fileId)}
+                  onOpenReceipt={openReceipt}
+                />
+              ))
+            )}
+
+            {/* ── 3. Completed ── */}
+            {archiveFolderId ? (
+              <>
+                <SectionHeading
+                  title="Completed"
+                  subtitle={
+                    archiveFiles.length > 0
+                      ? `${archiveFiles.length} file${archiveFiles.length === 1 ? '' : 's'} printed and moved to the Printed folder`
+                      : 'Printed files will be listed here'
+                  }
+                />
+                {archiveFiles.length > 0 ? (
+                  <View style={styles.card}>
+                    {completedShown.map((f, i) => (
+                      <View key={f.id} style={[styles.completedRow, i > 0 && styles.rowDivider]}>
+                        <Icon name="file-check-outline" size={18} color={Colors.active} />
+                        <Text style={styles.completedName} numberOfLines={1}>{f.name}</Text>
+                        <Text style={styles.completedLabel}>Completed</Text>
+                      </View>
+                    ))}
+                    {archiveFiles.length > 5 ? (
+                      <Pressable
+                        onPress={() => setShowAllCompleted(v => !v)}
+                        style={[styles.completedRow, styles.rowDivider]}>
+                        <Text style={styles.linkText}>
+                          {showAllCompleted ? 'Show fewer' : `Show all ${archiveFiles.length}`}
+                        </Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
+                ) : null}
+              </>
+            ) : null}
           </>
         ) : null}
 
-        {/* Parse results summary */}
-        {receipts.length > 0 ? (
-          <>
-            <SectionLabel title="Parsed Data" />
-            <View style={styles.receiptSummaryCard}>
-              <View style={styles.receiptSummaryHeader}>
-                <Text style={styles.receiptSummaryCount}>
-                  {receipts.length} transaction{receipts.length !== 1 ? 's' : ''}
-                </Text>
-                {canEnqueue ? (
-                  <Pressable
-                    style={styles.enqueueBtn}
-                    onPress={() => receipts.forEach(r => enqueueReceipt(r))}>
-                    <Text style={styles.enqueueBtnText}>Enqueue All</Text>
-                  </Pressable>
-                ) : (
-                  <Text style={styles.receiptSummaryCount}>{stateLabel[parsedState] ?? ''}</Text>
-                )}
-              </View>
-              {receipts.map((r, receiptIndex) => (
-                <Pressable
-                  key={`${r.sourceFile?.driveFileId}::${r.transactionType}::${r.transactionNumber}`}
-                  style={({pressed}) => [styles.receiptRow, pressed && styles.receiptRowPressed]}
-                  onPress={() => navigation.navigate('TransactionDetail', {receiptIndex})}
-                  accessibilityLabel={`View transaction ${r.transactionType} ${r.transactionNumber}`}>
-                  <Icon name="receipt" size={16} color={Colors.primary} />
-                  <Text style={styles.receiptRowText}>
-                    {r.transactionType} {r.transactionNumber} — {r.items.length} item{r.items.length !== 1 ? 's' : ''}
-                    {r.customer.name ? ` — ${r.customer.name}` : ''}
-                  </Text>
-                  <Icon name="chevron-right" size={18} color={Colors.textTertiary} />
-                </Pressable>
-              ))}
-            </View>
-          </>
-        ) : null}
+        {foldersReady ? foldersCard : null}
 
         <View style={styles.bottomPad} />
       </ScrollView>
@@ -352,85 +437,299 @@ export default function DriveScreen({navigation}: DriveScreenProps) {
 // Sub-components
 // ---------------------------------------------------------------------------
 
-function SectionLabel({
+const STATUS_COLOR: Record<CsvDisplayStatus | ReceiptRowStatus, string> = {
+  NEW: Colors.primaryLight,
+  READY: Colors.primaryLight,
+  QUEUED: Colors.warning,
+  PRINTING: Colors.active,
+  PRINT_FAILED: Colors.error,
+  FAILED: Colors.error,
+  ARCHIVE_PENDING: Colors.warning,
+  COMPLETED: Colors.active,
+  PRINTED: Colors.active,
+};
+
+function SectionHeading({
   title,
+  subtitle,
   action,
 }: {
   title: string;
+  subtitle?: string;
   action?: React.ReactNode;
 }) {
   return (
-    <View style={styles.sectionLabelRow}>
-      <Text style={styles.sectionLabel}>{title}</Text>
+    <View style={styles.sectionHeading}>
+      <View style={styles.flex}>
+        <Text style={styles.sectionTitle}>{title}</Text>
+        {subtitle ? <Text style={styles.sectionSubtitle}>{subtitle}</Text> : null}
+      </View>
       {action}
     </View>
   );
 }
 
-function FolderRow({
-  folder,
-  selected,
+function FolderLine({
+  label,
+  name,
+  path,
   onPress,
 }: {
-  folder: DriveFile;
-  selected: boolean;
+  label: string;
+  name: string | null;
+  path: string | null;
   onPress: () => void;
 }) {
   return (
+    <View style={styles.folderLine}>
+      <Icon name="folder-google-drive" size={20} color={name ? Colors.primaryLight : Colors.inactive} />
+      <View style={styles.flex}>
+        <Text style={styles.folderLabel}>{label} folder</Text>
+        <Text style={styles.folderName} numberOfLines={1}>
+          {name ? path || name : 'Not selected'}
+        </Text>
+      </View>
+      <Pressable
+        onPress={onPress}
+        style={({pressed}) => [styles.secondaryBtn, pressed && styles.pressed]}
+        accessibilityLabel={`${name ? 'Change' : 'Select'} ${label} folder`}>
+        <Text style={styles.secondaryBtnText}>{name ? 'Change' : 'Select'}</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+function StatusLine({status, label}: {status: CsvDisplayStatus | ReceiptRowStatus; label: string}) {
+  return (
+    <View style={styles.statusLine}>
+      <View style={[styles.statusPip, {backgroundColor: STATUS_COLOR[status]}]} />
+      <Text style={[styles.statusLabel, {color: STATUS_COLOR[status]}]}>{label}</Text>
+    </View>
+  );
+}
+
+function fileMeta(file: DriveFile): string {
+  const parts: string[] = [];
+  if (file.modifiedTime) {
+    const d = new Date(file.modifiedTime);
+    if (!isNaN(d.getTime())) {
+      parts.push(d.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}));
+    }
+  }
+  const bytes = Number(file.size);
+  if (file.size && !isNaN(bytes)) {
+    parts.push(bytes < 1024 ? `${bytes} B` : `${Math.max(1, Math.round(bytes / 1024))} KB`);
+  }
+  return parts.join(' · ');
+}
+
+function fileStatusDescription(status: CsvDisplayStatus, progress?: CsvProgress): string {
+  const counts = progress ? `${progress.printedCount} of ${progress.expectedCount} receipts printed. ` : '';
+  switch (status) {
+    case 'NEW':
+      return 'Tap Process CSV to send its receipts to the print queue.';
+    case 'READY':
+      return 'Some receipts are not in the print queue yet. Tap Process CSV to add them.';
+    case 'QUEUED':
+      return `${counts}Waiting in the print queue.`;
+    case 'PRINTING':
+      return `${counts}Printing now.`;
+    case 'PRINT_FAILED':
+      return `${counts}A receipt failed to print. Retry it from the Print Queue.`;
+    case 'ARCHIVE_PENDING':
+      return progress?.archiveStatus === 'FAILED'
+        ? 'All receipts printed, but the file could not be moved to the Printed folder.'
+        : 'All receipts printed. Moving the file to the Printed folder…';
+    default:
+      return '';
+  }
+}
+
+function IncomingFileCard({
+  file,
+  status,
+  progress,
+  processing,
+  disabled,
+  retrying,
+  onProcess,
+  onRetryArchive,
+}: {
+  file: DriveFile;
+  status: CsvDisplayStatus;
+  progress?: CsvProgress;
+  processing: boolean;
+  disabled: boolean;
+  retrying: boolean;
+  onProcess: () => void;
+  onRetryArchive: () => void;
+}) {
+  const meta = fileMeta(file);
+  const canProcess = status === 'NEW' || status === 'READY';
+  const canRetryArchive = status === 'ARCHIVE_PENDING' && progress?.archiveStatus === 'FAILED';
+  return (
+    <View style={styles.card}>
+      <View style={styles.fileHeader}>
+        <Icon name="file-document-outline" size={22} color={Colors.primaryLight} />
+        <View style={styles.flex}>
+          <Text style={styles.fileName} numberOfLines={2}>{file.name}</Text>
+          {meta ? <Text style={styles.fileMeta}>{meta}</Text> : null}
+        </View>
+      </View>
+      <View style={styles.cardBody}>
+        <StatusLine status={status} label={processing ? 'Processing…' : CSV_STATUS_LABEL[status]} />
+        <Text style={styles.statusDesc}>
+          {processing ? 'Reading the file and adding its receipts to the print queue.' : fileStatusDescription(status, progress)}
+        </Text>
+        {canRetryArchive && progress?.archiveError ? (
+          <Text style={styles.errorDetail}>{progress.archiveError}</Text>
+        ) : null}
+        {canProcess ? (
+          <Pressable
+            style={({pressed}) => [styles.primaryBtn, disabled && styles.btnDisabled, pressed && styles.pressed]}
+            onPress={onProcess}
+            disabled={disabled}
+            accessibilityLabel={`Process CSV ${file.name}`}>
+            {processing ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <Icon name="printer-outline" size={18} color="#fff" />
+            )}
+            <Text style={styles.primaryBtnText}>{processing ? 'Processing…' : 'Process CSV'}</Text>
+          </Pressable>
+        ) : null}
+        {canRetryArchive ? (
+          <RetryArchiveButton retrying={retrying} onPress={onRetryArchive} />
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+function RetryArchiveButton({retrying, onPress}: {retrying: boolean; onPress: () => void}) {
+  return (
     <Pressable
-      style={({pressed}) => [
-        styles.listRow,
-        selected && styles.listRowSelected,
-        pressed && styles.listRowPressed,
-      ]}
+      style={({pressed}) => [styles.outlineBtn, retrying && styles.btnDisabled, pressed && styles.pressed]}
       onPress={onPress}
-      accessibilityLabel={`Select folder ${folder.name}`}>
-      <Icon
-        name="folder-google-drive"
-        size={20}
-        color={selected ? Colors.primary : Colors.textSecondary}
-      />
-      <Text
-        style={[styles.listRowText, selected && styles.listRowTextSelected]}
-        numberOfLines={1}>
-        {folder.name}
-      </Text>
-      {selected && (
-        <Icon name="check-circle" size={18} color={Colors.active} />
+      disabled={retrying}
+      accessibilityLabel="Retry moving file to Printed folder">
+      {retrying ? (
+        <ActivityIndicator size="small" color={Colors.warning} />
+      ) : (
+        <Icon name="folder-move-outline" size={18} color={Colors.warning} />
       )}
+      <Text style={styles.outlineBtnText}>{retrying ? 'Moving file…' : 'Retry Move to Printed'}</Text>
     </Pressable>
   );
 }
 
-function CsvFileRow({
-  file,
-  loading,
-  onDownload,
+function groupDescription(group: ReceiptGroup): string {
+  switch (group.status) {
+    case 'READY':
+      return 'Not in the print queue yet.';
+    case 'QUEUED':
+      return 'Waiting in the print queue. Open the Print Queue to start printing.';
+    case 'PRINTING':
+      return 'Printing now.';
+    case 'PRINT_FAILED':
+      return 'A receipt failed to print. Retry it from the Print Queue.';
+    case 'ARCHIVE_PENDING':
+      return group.archiveFailed
+        ? 'All printed. The file still needs to be moved to the Printed folder.'
+        : 'All printed. Moving the file to the Printed folder…';
+    default:
+      return '';
+  }
+}
+
+function ReceiptGroupCard({
+  group,
+  retrying,
+  onAddToQueue,
+  onOpenQueue,
+  onRetryArchive,
+  onOpenReceipt,
 }: {
-  file: DriveFile;
-  loading: boolean;
-  onDownload: () => void;
+  group: ReceiptGroup;
+  retrying: boolean;
+  onAddToQueue: () => void;
+  onOpenQueue: () => void;
+  onRetryArchive: () => void;
+  onOpenReceipt: (row: ReceiptRow) => void;
 }) {
+  const count = group.rows.length;
+  const showQueueLink = group.status === 'QUEUED' || group.status === 'PRINT_FAILED';
   return (
-    <View style={styles.listRow}>
-      <Icon name="file-delimited-outline" size={20} color={Colors.textSecondary} />
-      <Text style={styles.listRowText} numberOfLines={1}>
-        {file.name}
-      </Text>
-      <Pressable
-        style={({pressed}) => [
-          styles.parseBtn,
-          pressed && styles.parseBtnPressed,
-        ]}
-        onPress={onDownload}
-        disabled={loading}
-        accessibilityLabel={`Parse ${file.name}`}>
-        {loading ? (
-          <ActivityIndicator size="small" color="#fff" />
-        ) : (
-          <Text style={styles.parseBtnText}>Parse</Text>
-        )}
-      </Pressable>
+    <View style={styles.card}>
+      <View style={styles.fileHeader}>
+        <Icon name="layers-outline" size={22} color={Colors.primaryLight} />
+        <View style={styles.flex}>
+          <Text style={styles.fileName} numberOfLines={1}>{group.fileName ?? 'CSV file'}</Text>
+          <Text style={styles.fileMeta}>
+            {count} receipt{count === 1 ? '' : 's'} extracted
+          </Text>
+        </View>
+      </View>
+      <View style={styles.cardBody}>
+        <StatusLine status={group.status} label={CSV_STATUS_LABEL[group.status]} />
+        <Text style={styles.statusDesc}>{groupDescription(group)}</Text>
+      </View>
+
+      {group.rows.map(row => {
+        const r = row.receipt;
+        const sub = [r.date, r.customer?.name].filter(Boolean).join(' · ');
+        return (
+          <Pressable
+            key={row.identity}
+            style={({pressed}) => [styles.receiptRow, styles.rowDivider, pressed && styles.pressed]}
+            onPress={() => onOpenReceipt(row)}
+            accessibilityLabel={`View ${r.transactionType} ${r.transactionNumber}, ${RECEIPT_STATUS_LABEL[row.status]}`}>
+            <View style={styles.flex}>
+              <View style={styles.receiptTitleRow}>
+                <Text style={styles.receiptTitle} numberOfLines={1}>
+                  {r.transactionType} {r.transactionNumber}
+                </Text>
+                {r.financials?.total !== undefined ? (
+                  <Text style={styles.receiptTotal}>{r.financials.total}</Text>
+                ) : null}
+              </View>
+              {sub ? <Text style={styles.fileMeta} numberOfLines={1}>{sub}</Text> : null}
+              <StatusLine status={row.status} label={RECEIPT_STATUS_LABEL[row.status]} />
+              {row.status === 'FAILED' && row.error ? (
+                <Text style={styles.errorDetail} numberOfLines={2}>{row.error}</Text>
+              ) : null}
+            </View>
+            <Icon name="chevron-right" size={18} color={Colors.textTertiary} />
+          </Pressable>
+        );
+      })}
+
+      {group.notQueued.length > 0 || showQueueLink || group.archiveFailed ? (
+        <View style={[styles.cardBody, styles.rowDivider]}>
+          {group.notQueued.length > 0 ? (
+            <Pressable
+              style={({pressed}) => [styles.primaryBtn, pressed && styles.pressed]}
+              onPress={onAddToQueue}
+              accessibilityLabel="Add all to Print Queue">
+              <Text style={styles.primaryBtnText}>
+                Add {group.notQueued.length} to Print Queue
+              </Text>
+            </Pressable>
+          ) : null}
+          {showQueueLink ? (
+            <Pressable
+              style={({pressed}) => [styles.primaryBtn, pressed && styles.pressed]}
+              onPress={onOpenQueue}
+              accessibilityLabel="Open Print Queue">
+              <Icon name="printer-outline" size={18} color="#fff" />
+              <Text style={styles.primaryBtnText}>Open Print Queue</Text>
+            </Pressable>
+          ) : null}
+          {group.status === 'ARCHIVE_PENDING' && group.archiveFailed ? (
+            <RetryArchiveButton retrying={retrying} onPress={onRetryArchive} />
+          ) : null}
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -522,173 +821,224 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
-  sectionLabelRow: {
+  noticeBanner: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    marginTop: Spacing.sm,
-    marginBottom: Spacing.xxs,
+    flexWrap: 'wrap',
+    gap: Spacing.sm,
+    backgroundColor: `${Colors.active}18`,
+    borderRadius: BorderRadius.md,
+    borderWidth: 1,
+    borderColor: `${Colors.active}55`,
+    padding: Spacing.md,
+  },
+  noticeText: {
+    ...Typography.captionMedium,
+    color: Colors.textPrimary,
+    flex: 1,
+    minWidth: 160,
+  },
+
+  flex: {flex: 1},
+  pressed: {opacity: 0.75},
+  divider: {height: 1, backgroundColor: Colors.border},
+  rowDivider: {borderTopWidth: 1, borderTopColor: Colors.border},
+
+  sectionHeading: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: Spacing.sm,
+    marginTop: Spacing.md,
     paddingHorizontal: 2,
   },
-  sectionLabel: {
-    ...Typography.label,
-    color: Colors.textSecondary,
-    textTransform: 'uppercase',
-    letterSpacing: 0.6,
-  },
-
-  selectedFolder: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.sm,
-    backgroundColor: `${Colors.primary}14`,
-    borderRadius: BorderRadius.sm,
-    borderWidth: 1,
-    borderColor: `${Colors.primary}44`,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.sm,
-    marginBottom: Spacing.xs,
-  },
-  selectedFolderName: {
-    ...Typography.body,
-    color: Colors.primaryLight,
-    fontWeight: '600',
-  },
-  folderTextContainer: {
-    flex: 1,
-    justifyContent: 'center',
-  },
-  selectedFolderPath: {
-    ...Typography.caption,
-    color: Colors.textSecondary,
-    fontSize: 11,
-    marginTop: 2,
-  },
-  changeBtn: {
-    paddingHorizontal: Spacing.sm,
-    paddingVertical: 2,
-    borderRadius: BorderRadius.sm,
-    borderWidth: 1,
-    borderColor: `${Colors.primary}44`,
-  },
-  changeBtnFull: {
-    paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.sm,
-    borderRadius: BorderRadius.sm,
-    borderWidth: 1,
-    borderColor: `${Colors.primary}44`,
-    alignItems: 'center',
-    backgroundColor: `${Colors.primary}14`,
-  },
-  changeBtnText: {
-    ...Typography.caption,
-    color: Colors.primaryLight,
-  },
-
-  folderPickerList: {
-    marginTop: Spacing.sm,
-    padding: Spacing.sm,
-    backgroundColor: Colors.card,
-    borderRadius: BorderRadius.md,
-    borderWidth: 1,
-    borderColor: Colors.border,
-  },
-  pickerHeader: {
-    ...Typography.captionMedium,
-    color: Colors.textSecondary,
-    marginBottom: Spacing.sm,
-  },
-
-  listRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.md,
-    backgroundColor: Colors.card,
-    borderRadius: BorderRadius.sm,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.sm,
-    borderWidth: 1,
-    borderColor: Colors.border,
-  },
-  listRowSelected: {
-    backgroundColor: `${Colors.primary}12`,
-    borderColor: `${Colors.primary}44`,
-  },
-  listRowPressed: {opacity: 0.8},
-  listRowText: {
-    ...Typography.body,
-    color: Colors.textSecondary,
-    flex: 1,
-  },
-  listRowTextSelected: {
-    color: Colors.primaryLight,
-  },
-
-  separator: {height: Spacing.xs},
-
-  parseBtn: {
-    backgroundColor: Colors.primary,
-    borderRadius: BorderRadius.sm,
-    paddingHorizontal: Spacing.sm,
-    paddingVertical: 4,
-    minWidth: 56,
-    alignItems: 'center',
-  },
-  parseBtnPressed: {opacity: 0.8},
-  parseBtnText: {
-    ...Typography.caption,
-    color: '#fff',
-    fontWeight: '600',
-  },
-
-  loader: {marginVertical: Spacing.md},
-  emptyMsg: {
-    ...Typography.body,
-    color: Colors.textTertiary,
-    textAlign: 'center',
-    padding: Spacing.base,
-  },
-
-  receiptSummaryCard: {
-    backgroundColor: Colors.card,
-    borderRadius: BorderRadius.md,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    padding: Spacing.md,
-    gap: Spacing.sm,
-    ...Shadow.sm,
-  },
-  receiptSummaryHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  receiptSummaryCount: {
+  sectionTitle: {
     ...Typography.bodyMedium,
     color: Colors.textPrimary,
     fontWeight: '700',
   },
-  enqueueBtn: {
-    backgroundColor: Colors.primary,
-    paddingHorizontal: Spacing.md,
-    paddingVertical: 6,
-    borderRadius: BorderRadius.sm,
-  },
-  enqueueBtnText: {
+  sectionSubtitle: {
     ...Typography.caption,
-    color: '#fff',
-    fontWeight: '600',
+    color: Colors.textSecondary,
+    marginTop: 2,
   },
+  linkText: {
+    ...Typography.captionMedium,
+    color: Colors.primaryLight,
+  },
+
+  card: {
+    backgroundColor: Colors.card,
+    borderRadius: BorderRadius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    overflow: 'hidden',
+    ...Shadow.sm,
+  },
+  cardBody: {
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+    gap: Spacing.xs,
+  },
+  emptyCard: {
+    alignItems: 'center',
+    gap: Spacing.xs,
+    backgroundColor: Colors.card,
+    borderRadius: BorderRadius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: Spacing.base,
+  },
+  emptyTitle: {
+    ...Typography.bodyMedium,
+    color: Colors.textPrimary,
+  },
+  emptyText: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
+    textAlign: 'center',
+  },
+
+  folderLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  folderLabel: {
+    ...Typography.label,
+    color: Colors.textTertiary,
+    textTransform: 'uppercase',
+  },
+  folderName: {
+    ...Typography.captionMedium,
+    color: Colors.textPrimary,
+    marginTop: 2,
+  },
+
+  fileHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+    paddingHorizontal: Spacing.md,
+    paddingTop: Spacing.md,
+  },
+  fileName: {
+    ...Typography.bodyMedium,
+    color: Colors.textPrimary,
+  },
+  fileMeta: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
+    marginTop: 2,
+  },
+
+  statusLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs,
+    marginTop: 2,
+  },
+  statusPip: {width: 8, height: 8, borderRadius: 4},
+  statusLabel: {
+    ...Typography.captionMedium,
+    fontWeight: '700',
+  },
+  statusDesc: {
+    ...Typography.caption,
+    color: Colors.textSecondary,
+  },
+  errorDetail: {
+    ...Typography.caption,
+    color: Colors.error,
+  },
+
+  primaryBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.xs,
+    backgroundColor: Colors.primary,
+    borderRadius: BorderRadius.sm,
+    minHeight: 46,
+    paddingHorizontal: Spacing.md,
+    marginTop: Spacing.xs,
+  },
+  primaryBtnText: {
+    ...Typography.bodyMedium,
+    color: '#fff',
+    fontWeight: '700',
+  },
+  btnDisabled: {opacity: 0.5},
+  outlineBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.xs,
+    borderRadius: BorderRadius.sm,
+    borderWidth: 1,
+    borderColor: `${Colors.warning}88`,
+    backgroundColor: Colors.warningDim,
+    minHeight: 46,
+    paddingHorizontal: Spacing.md,
+    marginTop: Spacing.xs,
+  },
+  outlineBtnText: {
+    ...Typography.bodyMedium,
+    color: Colors.warning,
+    fontWeight: '700',
+  },
+  secondaryBtn: {
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: Spacing.xs,
+    borderRadius: BorderRadius.sm,
+    borderWidth: 1,
+    borderColor: `${Colors.primary}66`,
+  },
+  secondaryBtnText: {
+    ...Typography.captionMedium,
+    color: Colors.primaryLight,
+  },
+
   receiptRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.sm,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
   },
-  receiptRowPressed: {opacity: 0.75},
-  receiptRowText: {
+  receiptTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.sm,
+  },
+  receiptTitle: {
+    ...Typography.captionMedium,
+    color: Colors.textPrimary,
+    fontWeight: '700',
+    flex: 1,
+  },
+  receiptTotal: {
+    ...Typography.captionMedium,
+    color: Colors.textPrimary,
+  },
+
+  completedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
+    paddingHorizontal: Spacing.md,
+    paddingVertical: Spacing.sm,
+  },
+  completedName: {
     ...Typography.caption,
     color: Colors.textSecondary,
     flex: 1,
+  },
+  completedLabel: {
+    ...Typography.captionMedium,
+    color: Colors.active,
   },
 
   bottomPad: {height: Spacing.xl},

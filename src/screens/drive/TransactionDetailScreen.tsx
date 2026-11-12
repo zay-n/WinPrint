@@ -42,7 +42,7 @@ export default function TransactionDetailScreen({route, navigation}: Props) {
           <Icon name="receipt-text-remove-outline" size={32} color={Colors.inactive} />
           <Text style={styles.missingTitle}>Transaction unavailable</Text>
           <Text style={styles.missingText}>
-            Parse the CSV again to inspect its transactions.
+            Process the CSV again to view its receipts.
           </Text>
         </View>
       </SafeAreaView>
@@ -170,6 +170,23 @@ export default function TransactionDetailScreen({route, navigation}: Props) {
           </View>
         ) : null}
 
+        <ReceiptDetails receipt={receipt} />
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+/**
+ * Read-only parsed details for one receipt. Shows stored values only — nothing
+ * is recalculated — and tolerates legacy records with missing sections.
+ */
+export function ReceiptDetails({receipt}: {receipt: Receipt}) {
+  const customer = receipt.customer ?? {};
+  const financials = receipt.financials ?? {};
+  const additional = receipt.additional ?? {};
+  const items = receipt.items ?? [];
+  return (
+    <>
         <DetailSection title="Transaction">
           <KeyValueRows
             rows={[
@@ -177,8 +194,7 @@ export default function TransactionDetailScreen({route, navigation}: Props) {
               ['Transaction Number', receipt.transactionNumber],
               ['Date', receipt.date],
               ['Source File', receipt.sourceFile?.driveFileName],
-              ['Drive File ID', receipt.sourceFile?.driveFileId],
-            ]}
+                          ]}
           />
         </DetailSection>
 
@@ -186,15 +202,15 @@ export default function TransactionDetailScreen({route, navigation}: Props) {
           <KeyValueRows
             emptyText="No customer details were supplied."
             rows={[
-              ['Name', receipt.customer.name],
-              ['Address 1', receipt.customer.address1],
-              ['Address 2', receipt.customer.address2],
-              ['City', receipt.customer.city],
-              ['Country', receipt.customer.country],
-              ['Phone', receipt.customer.phone],
-              ['Fax / Telex', receipt.customer.fax],
-              ['Account Type', receipt.customer.accountType],
-              ['Account Number', receipt.customer.accountNumber],
+              ['Name', customer.name],
+              ['Address 1', customer.address1],
+              ['Address 2', customer.address2],
+              ['City', customer.city],
+              ['Country', customer.country],
+              ['Phone', customer.phone],
+              ['Fax / Telex', customer.fax],
+              ['Account Type', customer.accountType],
+              ['Account Number', customer.accountNumber],
             ]}
           />
         </DetailSection>
@@ -202,14 +218,14 @@ export default function TransactionDetailScreen({route, navigation}: Props) {
         <DetailSection title="Totals">
           <KeyValueRows
             rows={[
-              ['Subtotal', formatNumber(receipt.financials.subtotal)],
-              ['Discount', formatNumber(receipt.financials.discountAmount)],
-              ['Freight', formatNumber(receipt.financials.freight)],
-              ['Taxable Amount', formatNumber(receipt.financials.taxableAmount)],
-              ['VAT', formatNumber(receipt.financials.vatAmount)],
-              ['VAT Rate', receipt.financials.vatRate === undefined ? undefined : `${receipt.financials.vatRate}%`],
-              ['Rounding', formatNumber(receipt.financials.rounding)],
-              ['Total', formatNumber(receipt.financials.total)],
+              ['Subtotal', formatNumber(financials.subtotal)],
+              ['Discount', formatNumber(financials.discountAmount)],
+              ['Freight', formatNumber(financials.freight)],
+              ['Taxable Amount', formatNumber(financials.taxableAmount)],
+              ['VAT', formatNumber(financials.vatAmount)],
+              ['VAT Rate', financials.vatRate === undefined ? undefined : `${financials.vatRate}%`],
+              ['Rounding', formatNumber(financials.rounding)],
+              ['Total', formatNumber(financials.total)],
             ]}
           />
         </DetailSection>
@@ -218,55 +234,55 @@ export default function TransactionDetailScreen({route, navigation}: Props) {
           <KeyValueRows
             emptyText="No additional transaction details were supplied."
             rows={[
-              ['Salesman', receipt.additional.salesman],
-              ['TRN', receipt.additional.trn],
-              ['LPO Number', receipt.additional.lpoNumber],
-              ['LPO Date', receipt.additional.lpoDate],
-              ['Remarks', receipt.additional.remarks],
-              ['Area', receipt.additional.area],
-              ['Supply Date', receipt.additional.supplyDate],
-              ['Transaction Code', receipt.additional.tranCode],
-              ['Tax Code', receipt.additional.taxCode],
-              ['VAT Tag', receipt.additional.vatTag],
-              ['Country Code', receipt.additional.countryCode],
-              ['Supplier Country', receipt.additional.msupCountry],
-              ['VAT Status', receipt.additional.vatStatus],
-              ['TRN Term', formatNumber(receipt.additional.trnTerm)],
+              ['Salesman', additional.salesman],
+              ['TRN', additional.trn],
+              ['LPO Number', additional.lpoNumber],
+              ['LPO Date', additional.lpoDate],
+              ['Remarks', additional.remarks],
+              ['Area', additional.area],
+              ['Supply Date', additional.supplyDate],
+              ['Transaction Code', additional.tranCode],
+              ['Tax Code', additional.taxCode],
+              ['VAT Tag', additional.vatTag],
+              ['Country Code', additional.countryCode],
+              ['Supplier Country', additional.msupCountry],
+              ['VAT Status', additional.vatStatus],
+              ['TRN Term', formatNumber(additional.trnTerm)],
             ]}
           />
         </DetailSection>
 
-        <DetailSection title={`Line Items (${receipt.items.length})`}>
-          {receipt.items.map((item, index) => (
+        <DetailSection title={`Line Items (${items.length})`}>
+          {items.map((item, index) => (
             <LineItemCard key={index} item={item} index={index} />
           ))}
         </DetailSection>
 
-        <RawSourceFields receipt={receipt} />
-      </ScrollView>
-    </SafeAreaView>
+        <RawSourceFields items={items} />
+    </>
   );
 }
 
-function TransactionHeader({receipt}: {receipt: Receipt}) {
+export function TransactionHeader({receipt, eyebrow = 'PARSED TRANSACTION'}: {receipt: Receipt; eyebrow?: string}) {
+  const itemCount = receipt.items?.length ?? 0;
   return (
     <View style={styles.headerCard}>
       <View style={styles.headerIcon}>
         <Icon name="file-document-outline" size={24} color={Colors.primaryLight} />
       </View>
       <View style={styles.headerContent}>
-        <Text style={styles.headerEyebrow}>PARSED TRANSACTION</Text>
+        <Text style={styles.headerEyebrow}>{eyebrow}</Text>
         <Text style={styles.headerTitle}>{receipt.transactionType} · {receipt.transactionNumber}</Text>
         <Text style={styles.headerSubtitle}>
-          {receipt.items.length} line item{receipt.items.length === 1 ? '' : 's'}
-          {receipt.customer.name ? ` · ${receipt.customer.name}` : ''}
+          {itemCount} line item{itemCount === 1 ? '' : 's'}
+          {receipt.customer?.name ? ` · ${receipt.customer.name}` : ''}
         </Text>
       </View>
     </View>
   );
 }
 
-function DetailSection({title, children}: {title: string; children: React.ReactNode}) {
+export function DetailSection({title, children}: {title: string; children: React.ReactNode}) {
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>{title}</Text>
@@ -275,7 +291,7 @@ function DetailSection({title, children}: {title: string; children: React.ReactN
   );
 }
 
-function KeyValueRows({
+export function KeyValueRows({
   rows,
   emptyText = 'No values available.',
 }: {
@@ -330,11 +346,11 @@ function LineItemCard({item, index}: {item: ReceiptItem; index: number}) {
   );
 }
 
-function RawSourceFields({receipt}: {receipt: Receipt}) {
+function RawSourceFields({items}: {items: ReceiptItem[]}) {
   const [expanded, setExpanded] = useState(false);
   const rawFieldCount = useMemo(
-    () => receipt.items.reduce((count, item) => count + Object.keys(item.sourceFields).length, 0),
-    [receipt.items],
+    () => items.reduce((count, item) => count + Object.keys(item.sourceFields ?? {}).length, 0),
+    [items],
   );
 
   return (
@@ -349,14 +365,14 @@ function RawSourceFields({receipt}: {receipt: Receipt}) {
         <View style={styles.sourceToggleContent}>
           <Text style={styles.sourceToggleTitle}>View All Source Fields</Text>
           <Text style={styles.sourceToggleDescription}>
-            {rawFieldCount} original column/value pairs across {receipt.items.length} line item{receipt.items.length === 1 ? '' : 's'}
+            {rawFieldCount} original column/value pairs across {items.length} line item{items.length === 1 ? '' : 's'}
           </Text>
         </View>
         <Icon name={expanded ? 'chevron-up' : 'chevron-down'} size={20} color={Colors.textSecondary} />
       </Pressable>
 
-      {expanded ? receipt.items.map((item, index) => (
-        <SourceFieldTable key={index} sourceFields={item.sourceFields} lineNumber={index + 1} />
+      {expanded ? items.map((item, index) => (
+        <SourceFieldTable key={index} sourceFields={item.sourceFields ?? {}} lineNumber={index + 1} />
       )) : null}
     </View>
   );

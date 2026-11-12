@@ -5,8 +5,9 @@ import Icon from '../../components/Icon';
 import { Colors, Spacing, BorderRadius, Typography, Shadow } from '../../theme';
 import { useAppStore } from '../../store/useAppStore';
 import type { QueueItem, CsvProgress } from '../../store/useAppStore';
+import type { HistoryScreenProps } from '../../navigation/types';
 
-export default function HistoryScreen() {
+export default function HistoryScreen({ navigation }: HistoryScreenProps) {
   const queue = useAppStore(s => s.queue);
   const csvProgress = useAppStore(s => s.csvProgress);
   const retryArchive = useAppStore(s => s.retryArchive);
@@ -55,7 +56,12 @@ export default function HistoryScreen() {
           data={printedItems}
           keyExtractor={item => item.identity}
           contentContainerStyle={styles.listContent}
-          renderItem={({ item }) => <HistoryItemRow item={item} />}
+          renderItem={({ item }) => (
+            <HistoryItemRow
+              item={item}
+              onPress={() => navigation.navigate('HistoryDetail', { identity: item.identity })}
+            />
+          )}
           ListEmptyComponent={
             <View style={styles.emptyState}>
               <Icon name="history" size={48} color={Colors.inactive} />
@@ -83,7 +89,8 @@ export default function HistoryScreen() {
   );
 }
 
-function HistoryItemRow({ item }: { item: QueueItem }) {
+function HistoryItemRow({ item, onPress }: { item: QueueItem; onPress: () => void }) {
+  const receipt = item.receipt ?? ({} as Partial<QueueItem['receipt']>);
   const printedAt = item.completedAt
     ? new Date(item.completedAt).toLocaleString([], {
         month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -91,12 +98,16 @@ function HistoryItemRow({ item }: { item: QueueItem }) {
     : 'Unknown';
 
   return (
-    <View style={styles.itemCard}>
+    <Pressable
+      style={({ pressed }) => [styles.itemCard, pressed && styles.pressed]}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`View details for ${receipt.transactionType ?? ''} ${receipt.transactionNumber ?? ''}`}>
       <View style={styles.itemHeader}>
         <View style={styles.itemTitleRow}>
-          <Icon name="check-circle" size={18} color={Colors.active} />
+          <Icon name="check-circle-outline" size={18} color={Colors.active} />
           <Text style={styles.itemTitle}>
-            {item.receipt.transactionType} {item.receipt.transactionNumber}
+            {receipt.transactionType} {receipt.transactionNumber}
           </Text>
         </View>
         <View style={styles.printedBadge}>
@@ -107,20 +118,24 @@ function HistoryItemRow({ item }: { item: QueueItem }) {
         <View style={styles.itemMetaRow}>
           <Icon name="account-outline" size={13} color={Colors.textTertiary} />
           <Text style={styles.itemMetaText}>
-            {item.receipt.customer.name || 'N/A'}
+            {receipt.customer?.name || 'N/A'}
           </Text>
         </View>
         <View style={styles.itemMetaRow}>
           <Icon name="currency-usd" size={13} color={Colors.textTertiary} />
           <Text style={styles.itemMetaText}>
-            {item.receipt.financials.total}
+            {receipt.financials?.total ?? '—'}
           </Text>
         </View>
       </View>
-      <Text style={styles.itemDate}>
-        {printedAt}
-      </Text>
-    </View>
+      <View style={styles.itemFooter}>
+        <Text style={styles.itemDate}>{printedAt}</Text>
+        <View style={styles.itemMetaRow}>
+          <Text style={styles.viewDetailsText}>View details</Text>
+          <Icon name="chevron-right" size={16} color={Colors.primaryLight} />
+        </View>
+      </View>
+    </Pressable>
   );
 }
 
@@ -289,6 +304,15 @@ const styles = StyleSheet.create({
     color: Colors.textTertiary,
     fontSize: 10,
     marginTop: Spacing.xs,
+  },
+  itemFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  viewDetailsText: {
+    ...Typography.captionMedium,
+    color: Colors.primaryLight,
   },
   printedBadge: {
     backgroundColor: `${Colors.active}18`,
